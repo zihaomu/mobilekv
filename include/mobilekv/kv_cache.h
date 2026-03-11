@@ -8,10 +8,6 @@
 extern "C" {
 #endif
 
-/* ================================================================
-   Status
-   ================================================================ */
-
 typedef enum {
   KV_OK = 0,
   KV_ERR_NULL,
@@ -21,158 +17,104 @@ typedef enum {
   KV_ERR_UNSUPPORTED
 } KVStatus;
 
-/* ================================================================
-   Data Type
-   ================================================================ */
-
 typedef enum {
   KV_DTYPE_FP16 = 0,
   KV_DTYPE_INT8 = 1
 } KVDataType;
-
-/* ================================================================
-   Layout Type
-   ================================================================ */
-
-typedef enum {
-  KV_LAYOUT_LAYER_TOKEN_HIDDEN = 0,
-  KV_LAYOUT_RING = 1
-} KVLayoutType;
-
-/* ================================================================
-   Backend
-   ================================================================ */
 
 typedef enum {
   KV_BACKEND_CPU = 0,
   KV_BACKEND_GPU = 1
 } KVBackendType;
 
-/* ================================================================
-   Model Shape
-   ================================================================ */
-
 typedef struct {
-
   int layers;
   int heads;
   int head_dim;
-
-  /* hidden = heads * head_dim */
-  int hidden;
-
-  /* maximum KV tokens stored physically */
-  int max_seq;
-
+  int hidden;   /* heads * head_dim */
+  int max_seq;  /* total physical capacity */
 } KVShape;
 
-/* ================================================================
-   Sliding Window Policy
-   ================================================================ */
-
 typedef struct {
-
-  /* maximum allowed prefix tokens */
-  int max_prefix_tokens;
-
-  /* rolling window size */
-  int recent_keep;
-
+  int max_prefix_tokens;  /* reserved prefix capacity */
+  int recent_keep;        /* recent logical window */
+  int use_ring_buffer;    /* 0 = compact/memmove, 1 = ring for recent zone */
 } KVPolicy;
 
-/* ================================================================
-   Quantization Config (reserved)
-   ================================================================ */
-
 typedef struct {
-
   int enabled;
   int group_size;
   int scale_bytes;
-
 } KVQuantConfig;
 
-/* ================================================================
-   KV Config
-   ================================================================ */
-
 typedef struct {
-
   KVShape shape;
   KVPolicy policy;
-
   KVDataType dtype;
-  KVLayoutType layout;
   KVBackendType backend;
-
   KVQuantConfig quant;
-
 } KVConfig;
 
-/* ================================================================
-   Runtime State
-   ================================================================ */
-
 typedef struct {
-
-  int cursor;
-  int valid_tokens;
-
-  /* logical base token in original stream */
-  int base_token;
+  int cursor;          /* logical total tokens = prefix + recent_valid */
+  int valid_tokens;    /* logical visible tokens */
+  int base_token;      /* number of dropped recent tokens from original stream */
 
   int prefix_frozen;
-  int prefix_tokens;
+  int prefix_tokens;   /* actual frozen prefix length */
 
+  /* ring metadata for recent zone */
+  int recent_head;     /* physical write head within recent zone [0, recent_capacity) */
+  int recent_size;     /* logical recent token count <= recent_capacity */
 } KVState;
 
-/* ================================================================
-   Internal Arena
-   ================================================================ */
-
 typedef struct {
-
   void* k_data;
   void* v_data;
-
   void* k_scales;
   void* v_scales;
-
   size_t k_bytes;
   size_t v_bytes;
-
   size_t k_scales_bytes;
   size_t v_scales_bytes;
-
 } KVCPUArena;
 
-/* ================================================================
-   KV Cache Object
-   ================================================================ */
-
 typedef struct KVCache {
-
   KVConfig config;
   KVState state;
 
   void* arena_base;
   size_t arena_bytes;
-
   KVCPUArena arena;
 
   int initialized;
-
 } KVCache;
 
-/* ================================================================
-   Memory Requirement
-   ================================================================ */
+typedef struct {
+  int start_token;   /* physical token slot in storage */
+  int token_count;
+} KVSegment;
 
+typedef struct {
+  int segment_count; /* 1 or 2 */
+  KVSegment segments[2];
+} KVReadView;
+
+typedef struct {
+  const void* k_base;
+  const void* v_base;
+  int token_count;
+  size_t token_stride_bytes;
+} KVLayerReadSpan;
+
+typedef struct {
+  const void* k;
+  const void* v;
+  size_t layer_stride_bytes;
+} KVAppendView;
+
+/* lifecycle */
 size_t KVRequiredBytes(const KVConfig* config);
-
-/* ================================================================
-   Lifecycle
-   ================================================================ */
 
 KVStatus KVInitPreallocated(
     KVCache* kv,
@@ -181,41 +123,17 @@ KVStatus KVInitPreallocated(
     size_t arena_bytes);
 
 void KVReset(KVCache* kv);
+KVStatus KVSealPrefix(KVCache* kv, int prefix_tokens);
 
-/* seal prefix after system prompt */
-KVStatus KVSealPrefix(
-    KVCache* kv,
-    int prefix_tokens);
-
-/* ================================================================
-   Append API
-   ================================================================ */
-
-/* simple append: input layout = [layers][hidden] */
-
+/* write */
 KVStatus KVAppend(
     KVCache* kv,
     const void* new_k_layers,
     const void* new_v_layers);
 
-/* flexible append view */
-
-typedef struct {
-
-  const void* k;
-  const void* v;
-
-  size_t layer_stride_bytes;
-
-} KVAppendView;
-
 KVStatus KVAppendViewWrite(
     KVCache* kv,
     const KVAppendView* view);
-
-/* ================================================================
-   Token Reservation Mode (runtime friendly)
-   ================================================================ */
 
 KVStatus KVReserveTokenSlot(
     KVCache* kv,
@@ -233,131 +151,72 @@ KVStatus KVCommitToken(
     KVCache* kv,
     int token);
 
-/* ================================================================
-   Compact (prefix + recent sliding window)
-   ================================================================ */
-
 KVStatus KVCompact(KVCache* kv);
 
-/* ================================================================
-   Read View
-   ================================================================ */
-
-typedef struct {
-
-  int start_token;
-  int token_count;
-
-} KVSegment;
-
-typedef struct {
-
-  int segment_count;
-
-  KVSegment segments[2];
-
-} KVReadView;
-
+/* read */
 KVStatus KVGetReadView(
     const KVCache* kv,
     KVReadView* view);
-
-/* ================================================================
-   Layer Read Span (fast decode)
-   ================================================================ */
-
-typedef struct {
-
-  const void* k_base;
-  const void* v_base;
-
-  int token_count;
-
-  size_t token_stride_bytes;
-
-} KVLayerReadSpan;
 
 KVStatus KVGetLayerReadSpan(
     const KVCache* kv,
     int layer,
     KVLayerReadSpan* span);
 
-/* ================================================================
-   Token Access
-   ================================================================ */
+/* token access */
+const void* KVKToken(const KVCache* kv, int layer, int token);
+const void* KVVToken(const KVCache* kv, int layer, int token);
 
-const void* KVKToken(
-    const KVCache* kv,
-    int layer,
-    int token);
+const uint16_t* KVKTokenFP16(const KVCache* kv, int layer, int token);
+const uint16_t* KVVTokenFP16(const KVCache* kv, int layer, int token);
 
-const void* KVVToken(
-    const KVCache* kv,
-    int layer,
-    int token);
+const int8_t* KVKTokenINT8(const KVCache* kv, int layer, int token);
+const int8_t* KVVTokenINT8(const KVCache* kv, int layer, int token);
 
-/* typed helpers */
-
-const uint16_t* KVKTokenFP16(
-    const KVCache* kv,
-    int layer,
-    int token);
-
-const uint16_t* KVVTokenFP16(
-    const KVCache* kv,
-    int layer,
-    int token);
-
-const int8_t* KVKTokenINT8(
-    const KVCache* kv,
-    int layer,
-    int token);
-
-const int8_t* KVVTokenINT8(
-    const KVCache* kv,
-    int layer,
-    int token);
-
-/* ================================================================
-   Metadata
-   ================================================================ */
-
+/* metadata */
 int KVValidTokens(const KVCache* kv);
-
 int KVCursor(const KVCache* kv);
-
 int KVBaseToken(const KVCache* kv);
-
 int KVPrefixTokens(const KVCache* kv);
-
 int KVRecentTokens(const KVCache* kv);
-
 KVDataType KVDType(const KVCache* kv);
-
-KVLayoutType KVLayout(const KVCache* kv);
-
 int KVIsInitialized(const KVCache* kv);
 
-/* ================================================================
-   Compatibility Helpers (llama.cpp style)
-   ================================================================ */
-
+// For attention view construction
 typedef struct {
+  /* base storage */
+  const void* k_base;
+  const void* v_base;
 
-  const void* k;
-  const void* v;
+  size_t layer_stride_bytes;
+  size_t token_stride_bytes;
 
-  int n_tokens;
-  int hidden;
+  /* logical info */
+  int q_pos;               /* logical query position */
+  int visible_tokens;      /* prefix + recent */
 
-  size_t stride_bytes;
+  int prefix_tokens;       /* frozen prefix length */
 
-} KVCompatLlamaSpan;
+  /* recent window logical range */
+  int recent_logical_start;
+  int recent_size;
+  int recent_capacity;
 
-KVStatus KVCompatGetLlamaSpan(
+  /* ring physical mapping */
+  int recent_first_slot;   /* physical slot of oldest recent token */
+  int recent_wrapped;      /* whether window crosses end of ring */
+
+} KVAttentionView;
+
+KVStatus KVGetAttentionView(
     const KVCache* kv,
-    int layer,
-    KVCompatLlamaSpan* span);
+    int q_pos,
+    KVAttentionView* view);
+
+int KVRecentFirstPhysicalSlot(const KVCache* kv);
+
+int KVRecentLogicalStart(const KVCache* kv);
+
 
 #ifdef __cplusplus
 }

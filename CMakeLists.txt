@@ -22,9 +22,14 @@ target_compile_features(mobilekv PUBLIC cxx_std_17)
 
 if(MOBILEKV_BUILD_EXAMPLES)
   add_executable(mobilekv_demo
-    example/demo.cpp
+    example/kv_cache_basic_example.cpp
   )
   target_link_libraries(mobilekv_demo PRIVATE mobilekv::mobilekv)
+
+  add_executable(mobilekv_llama_adapter_demo
+    example/llama.cpp_adapter.cpp
+  )
+  target_link_libraries(mobilekv_llama_adapter_demo PRIVATE mobilekv::mobilekv)
 endif()
 
 if(MOBILEKV_BUILD_BENCHMARKS)
