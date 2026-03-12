@@ -12,6 +12,9 @@ typedef struct {
   int base_token;
 } BenchResult;
 
+static const int kPrefixTokens = 128;
+static const int kRecentKeep = 895;
+
 static KVConfig MakeBenchConfig(int use_ring_buffer) {
   KVConfig cfg{};
   cfg.shape.layers = 8;
@@ -19,9 +22,9 @@ static KVConfig MakeBenchConfig(int use_ring_buffer) {
   cfg.shape.head_dim = 64;
   cfg.shape.hidden = 512;
   cfg.shape.max_seq = 1024;
-  cfg.policy.max_prefix_tokens = 128;
-  cfg.policy.recent_keep = 895;
-  cfg.policy.use_ring_buffer = use_ring_buffer;
+  cfg.policy.max_prefix_tokens = kPrefixTokens;
+  cfg.policy.recent_keep = kRecentKeep;
+  cfg.policy.use_ring_buffer = (use_ring_buffer != 0);
   cfg.dtype = KV_DTYPE_FP16;
   cfg.backend = KV_BACKEND_CPU;
   return cfg;
@@ -59,12 +62,12 @@ static BenchResult RunAppendBenchmark(int use_ring_buffer, int steps) {
     return ret;
   }
 
-  for (int i = 0; i < cfg.policy.max_prefix_tokens; ++i) {
+  for (int i = 0; i < kPrefixTokens; ++i) {
     FillToken(k, one_token_elems, (uint16_t)(100 + i));
     FillToken(v, one_token_elems, (uint16_t)(200 + i));
     (void)KVAppend(&kv, k, v);
   }
-  (void)KVSealPrefix(&kv, cfg.policy.max_prefix_tokens);
+  (void)KVSealPrefix(&kv, kPrefixTokens);
 
   const clock_t t0 = clock();
   for (int i = 0; i < steps; ++i) {

@@ -13,7 +13,7 @@ KVConfig MakeConfig(
     int hidden,
     int max_seq,
     int max_prefix,
-    int recent_keep,
+    int recent_keep = -1,
     bool use_ring = false) {
   KVConfig cfg{};
   cfg.shape.layers = layers;
@@ -22,8 +22,8 @@ KVConfig MakeConfig(
   cfg.shape.hidden = hidden;
   cfg.shape.max_seq = max_seq;
   cfg.policy.max_prefix_tokens = max_prefix;
-  cfg.policy.recent_keep = recent_keep;
-  cfg.policy.use_ring_buffer = use_ring ? 1 : 0;
+  cfg.policy.recent_keep = (recent_keep >= 0) ? recent_keep : (max_seq - max_prefix);
+  cfg.policy.use_ring_buffer = use_ring;
   cfg.dtype = KV_DTYPE_FP16;
   cfg.backend = KV_BACKEND_CPU;
   return cfg;
@@ -44,10 +44,17 @@ KVFixture CreateFixture(const KVConfig& cfg) {
   return f;
 }
 
+const uint16_t* ReadKTokenFP16(const KVCache* kv, int layer, int logical_token) {
+  KVAttentionLayerArg arg{};
+  arg.dtype = KV_DTYPE_FP16;
+  if (KVAttentionReadLayer(kv, layer, logical_token, &arg) != KV_OK) return nullptr;
+  return static_cast<const uint16_t*>(arg.k_data);
+}
+
 }  // namespace
 
 TEST(KVCacheLifecycleTest, RequiredBytesSanity) {
-  KVConfig cfg = MakeConfig(/*layers=*/2, /*hidden=*/8, /*max_seq=*/16, /*max_prefix=*/4, /*recent_keep=*/8);
+  KVConfig cfg = MakeConfig(/*layers=*/2, /*hidden=*/8, /*max_seq=*/16, /*max_prefix=*/4);
 
   EXPECT_GT(KVRequiredBytes(&cfg), 0u);
   EXPECT_EQ(KVRequiredBytes(nullptr), 0u);
@@ -56,8 +63,93 @@ TEST(KVCacheLifecycleTest, RequiredBytesSanity) {
   EXPECT_EQ(KVRequiredBytes(&cfg), 0u);
 }
 
+TEST(KVCacheLifecycleTest, ReleaseDetachesHandleAndIsIdempotentForPreallocated) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/1,
+      /*hidden=*/4,
+      /*max_seq=*/4,
+      /*max_prefix=*/0));
+
+  std::array<uint16_t, 4> k = {1, 2, 3, 4};
+  std::array<uint16_t, 4> v = {11, 12, 13, 14};
+  ASSERT_EQ(KVAppend(&fixture.kv, k.data(), v.data()), KV_OK);
+  ASSERT_EQ(KVValidTokens(&fixture.kv), 1);
+
+  EXPECT_EQ(KVRelease(&fixture.kv), KV_OK);
+  EXPECT_FALSE(KVIsInitialized(&fixture.kv));
+  EXPECT_EQ(KVValidTokens(&fixture.kv), 0);
+  EXPECT_EQ(KVAppend(&fixture.kv, k.data(), v.data()), KV_ERR_BAD_STATE);
+
+  KVAttentionView view{};
+  EXPECT_EQ(KVGetAttentionView(&fixture.kv, /*q_pos=*/0, &view), KV_ERR_BAD_STATE);
+
+  /* idempotent release */
+  EXPECT_EQ(KVRelease(&fixture.kv), KV_OK);
+  EXPECT_EQ(KVRelease(nullptr), KV_ERR_NULL);
+}
+
+TEST(KVCacheLifecycleTest, InitOwnedAndReleaseWorks) {
+  KVConfig cfg = MakeConfig(
+      /*layers=*/1,
+      /*hidden=*/4,
+      /*max_seq=*/4,
+      /*max_prefix=*/0);
+  KVCache kv{};
+
+  ASSERT_EQ(KVInit(&kv, &cfg), KV_OK);
+  EXPECT_TRUE(KVIsInitialized(&kv));
+
+  std::array<uint16_t, 4> k = {1, 2, 3, 4};
+  std::array<uint16_t, 4> v = {11, 12, 13, 14};
+  ASSERT_EQ(KVAppend(&kv, k.data(), v.data()), KV_OK);
+  EXPECT_EQ(KVValidTokens(&kv), 1);
+
+  EXPECT_EQ(KVRelease(&kv), KV_OK);
+  EXPECT_FALSE(KVIsInitialized(&kv));
+  EXPECT_EQ(KVAppend(&kv, k.data(), v.data()), KV_ERR_BAD_STATE);
+}
+
+TEST(KVCacheSnapshotTest, CapturesRuntimeMetadata) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/1,
+      /*hidden=*/4,
+      /*max_seq=*/4,
+      /*max_prefix=*/0));
+
+  KVSnapshot snapshot{};
+  ASSERT_EQ(KVGetSnapshot(&fixture.kv, &snapshot), KV_OK);
+  EXPECT_TRUE(snapshot.initialized);
+  EXPECT_EQ(snapshot.valid_tokens, 0);
+  EXPECT_EQ(snapshot.cursor, 0);
+  EXPECT_EQ(snapshot.base_token, 0);
+  EXPECT_EQ(snapshot.prefix_tokens, 0);
+  EXPECT_EQ(snapshot.recent_tokens, 0);
+  EXPECT_EQ(snapshot.dtype, KV_DTYPE_FP16);
+
+  std::array<uint16_t, 4> k = {1, 2, 3, 4};
+  std::array<uint16_t, 4> v = {11, 12, 13, 14};
+  ASSERT_EQ(KVAppend(&fixture.kv, k.data(), v.data()), KV_OK);
+
+  ASSERT_EQ(KVGetSnapshot(&fixture.kv, &snapshot), KV_OK);
+  EXPECT_EQ(snapshot.valid_tokens, KVValidTokens(&fixture.kv));
+  EXPECT_EQ(snapshot.cursor, KVCursor(&fixture.kv));
+  EXPECT_EQ(snapshot.base_token, KVBaseToken(&fixture.kv));
+  EXPECT_EQ(snapshot.prefix_tokens, KVPrefixTokens(&fixture.kv));
+  EXPECT_EQ(snapshot.recent_tokens, KVRecentTokens(&fixture.kv));
+  EXPECT_EQ(snapshot.dtype, KVDType(&fixture.kv));
+  EXPECT_EQ(snapshot.initialized, KVIsInitialized(&fixture.kv));
+}
+
+TEST(KVCacheSnapshotTest, ArgumentValidation) {
+  KVSnapshot snapshot{};
+  KVCache raw{};
+
+  EXPECT_EQ(KVGetSnapshot(nullptr, &snapshot), KV_ERR_NULL);
+  EXPECT_EQ(KVGetSnapshot(&raw, nullptr), KV_ERR_NULL);
+}
+
 TEST(KVCacheAppendTest, InitAndAppendRoundTrip) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0, /*recent_keep=*/8));
+  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0));
 
   std::array<uint16_t, 8> k = {11, 12, 13, 14, 21, 22, 23, 24};
   std::array<uint16_t, 8> v = {31, 32, 33, 34, 41, 42, 43, 44};
@@ -67,8 +159,8 @@ TEST(KVCacheAppendTest, InitAndAppendRoundTrip) {
   EXPECT_EQ(KVCursor(&fixture.kv), 1);
   EXPECT_EQ(KVDType(&fixture.kv), KV_DTYPE_FP16);
 
-  const uint16_t* k_l0_t0 = KVKTokenFP16(&fixture.kv, 0, 0);
-  const uint16_t* k_l1_t0 = KVKTokenFP16(&fixture.kv, 1, 0);
+  const uint16_t* k_l0_t0 = ReadKTokenFP16(&fixture.kv, 0, 0);
+  const uint16_t* k_l1_t0 = ReadKTokenFP16(&fixture.kv, 1, 0);
   ASSERT_NE(k_l0_t0, nullptr);
   ASSERT_NE(k_l1_t0, nullptr);
   EXPECT_EQ(k_l0_t0[0], 11);
@@ -76,15 +168,10 @@ TEST(KVCacheAppendTest, InitAndAppendRoundTrip) {
   EXPECT_EQ(k_l1_t0[0], 21);
   EXPECT_EQ(k_l1_t0[3], 24);
 
-  KVReadView view{};
-  EXPECT_EQ(KVGetReadView(&fixture.kv, &view), KV_OK);
-  EXPECT_EQ(view.segment_count, 1);
-  EXPECT_EQ(view.segments[0].start_token, 0);
-  EXPECT_EQ(view.segments[0].token_count, 1);
 }
 
 TEST(KVCacheCompactionTest, CompactKeepsPrefixAndRecentWindow) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/1, /*hidden=*/2, /*max_seq=*/4, /*max_prefix=*/1, /*recent_keep=*/2));
+  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/1, /*hidden=*/2, /*max_seq=*/4, /*max_prefix=*/1));
 
   for (int token = 0; token < 4; ++token) {
     std::array<uint16_t, 2> k = {
@@ -109,10 +196,10 @@ TEST(KVCacheCompactionTest, CompactKeepsPrefixAndRecentWindow) {
   EXPECT_EQ(KVPrefixTokens(&fixture.kv), 1);
   EXPECT_EQ(KVBaseToken(&fixture.kv), 1);
 
-  const uint16_t* t0 = KVKTokenFP16(&fixture.kv, 0, 0);
-  const uint16_t* t1 = KVKTokenFP16(&fixture.kv, 0, 1);
-  const uint16_t* t2 = KVKTokenFP16(&fixture.kv, 0, 2);
-  const uint16_t* t3 = KVKTokenFP16(&fixture.kv, 0, 3);
+  const uint16_t* t0 = ReadKTokenFP16(&fixture.kv, 0, 0);
+  const uint16_t* t1 = ReadKTokenFP16(&fixture.kv, 0, 1);
+  const uint16_t* t2 = ReadKTokenFP16(&fixture.kv, 0, 2);
+  const uint16_t* t3 = ReadKTokenFP16(&fixture.kv, 0, 3);
   ASSERT_NE(t0, nullptr);
   ASSERT_NE(t1, nullptr);
   ASSERT_NE(t2, nullptr);
@@ -124,8 +211,8 @@ TEST(KVCacheCompactionTest, CompactKeepsPrefixAndRecentWindow) {
   EXPECT_EQ(t3[0], 41);
 }
 
-TEST(KVCacheCompactionTest, SealPrefixRejectsExceedingPolicy) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/1, /*hidden=*/2, /*max_seq=*/8, /*max_prefix=*/2, /*recent_keep=*/6));
+TEST(KVCacheCompactionTest, SealPrefixRejectsInvalidRuntimeWindow) {
+  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/1, /*hidden=*/2, /*max_seq=*/8, /*max_prefix=*/2));
 
   for (int token = 0; token < 3; ++token) {
     std::array<uint16_t, 2> k = {
@@ -143,8 +230,55 @@ TEST(KVCacheCompactionTest, SealPrefixRejectsExceedingPolicy) {
   EXPECT_EQ(KVSealPrefix(&fixture.kv, 2), KV_OK);
 }
 
+TEST(KVCacheCompactionTest, NonRingDelaysCompactUntilArenaEnd) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/1,
+      /*hidden=*/2,
+      /*max_seq=*/8,
+      /*max_prefix=*/2,
+      /*recent_keep=*/2,
+      /*use_ring=*/false));
+
+  std::array<uint16_t, 2> p0 = {101, 102};
+  std::array<uint16_t, 2> p1 = {201, 202};
+  ASSERT_EQ(KVAppend(&fixture.kv, p0.data(), p0.data()), KV_OK);
+  ASSERT_EQ(KVAppend(&fixture.kv, p1.data(), p1.data()), KV_OK);
+  ASSERT_EQ(KVSealPrefix(&fixture.kv, 1), KV_OK);
+
+  for (int i = 0; i < 5; ++i) {
+    std::array<uint16_t, 2> tok = {
+        static_cast<uint16_t>(300 + i * 10 + 1),
+        static_cast<uint16_t>(300 + i * 10 + 2),
+    };
+    ASSERT_EQ(KVAppend(&fixture.kv, tok.data(), tok.data()), KV_OK);
+  }
+
+  /* No early compact: cursor can advance to physical arena end first. */
+  EXPECT_EQ(KVCursor(&fixture.kv), 8);
+  EXPECT_EQ(KVRecentTokens(&fixture.kv), 2);
+  EXPECT_EQ(KVValidTokens(&fixture.kv), 3);
+  EXPECT_EQ(KVBaseToken(&fixture.kv), 4);
+
+  std::array<uint16_t, 2> tok6 = {351, 352};
+  ASSERT_EQ(KVAppend(&fixture.kv, tok6.data(), tok6.data()), KV_OK);
+  EXPECT_LT(KVCursor(&fixture.kv), 8);  // compact then append
+  EXPECT_EQ(KVRecentTokens(&fixture.kv), 2);
+  EXPECT_EQ(KVValidTokens(&fixture.kv), 3);
+  EXPECT_EQ(KVBaseToken(&fixture.kv), 5);
+
+  const uint16_t* t0 = ReadKTokenFP16(&fixture.kv, 0, 0);
+  const uint16_t* t1 = ReadKTokenFP16(&fixture.kv, 0, 1);
+  const uint16_t* t2 = ReadKTokenFP16(&fixture.kv, 0, 2);
+  ASSERT_NE(t0, nullptr);
+  ASSERT_NE(t1, nullptr);
+  ASSERT_NE(t2, nullptr);
+  EXPECT_EQ(t0[0], 101);
+  EXPECT_EQ(t1[0], 341);
+  EXPECT_EQ(t2[0], 351);
+}
+
 TEST(KVCacheAppendViewTest, AppendViewRejectsTooSmallStride) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0, /*recent_keep=*/8));
+  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0));
 
   std::array<uint16_t, 16> k = {
       11, 12, 13, 14, 21, 22, 23, 24,
@@ -171,7 +305,7 @@ TEST(KVCacheAppendViewTest, AppendViewRejectsTooSmallStride) {
 }
 
 TEST(KVCacheReservationTest, ReserveWriteCommitTokenFlow) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0, /*recent_keep=*/8));
+  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0));
 
   int token = -1;
   ASSERT_EQ(KVReserveTokenSlot(&fixture.kv, &token), KV_OK);
@@ -183,16 +317,24 @@ TEST(KVCacheReservationTest, ReserveWriteCommitTokenFlow) {
   std::array<uint16_t, 4> v_l0 = {11, 12, 13, 14};
   std::array<uint16_t, 4> k_l1 = {21, 22, 23, 24};
   std::array<uint16_t, 4> v_l1 = {31, 32, 33, 34};
+  KVAttentionLayerArg arg_l0{};
+  arg_l0.dtype = KV_DTYPE_FP16;
+  arg_l0.k_data = k_l0.data();
+  arg_l0.v_data = v_l0.data();
+  KVAttentionLayerArg arg_l1{};
+  arg_l1.dtype = KV_DTYPE_FP16;
+  arg_l1.k_data = k_l1.data();
+  arg_l1.v_data = v_l1.data();
 
-  ASSERT_EQ(KVWriteLayerToken(&fixture.kv, 0, token, k_l0.data(), v_l0.data(), sizeof(k_l0)), KV_OK);
-  ASSERT_EQ(KVWriteLayerToken(&fixture.kv, 1, token, k_l1.data(), v_l1.data(), sizeof(k_l1)), KV_OK);
+  ASSERT_EQ(KVAttentionWriteLayer(&fixture.kv, 0, token, &arg_l0), KV_OK);
+  ASSERT_EQ(KVAttentionWriteLayer(&fixture.kv, 1, token, &arg_l1), KV_OK);
 
   EXPECT_EQ(KVCommitToken(&fixture.kv, token), KV_OK);
   EXPECT_EQ(KVCursor(&fixture.kv), 1);
   EXPECT_EQ(KVValidTokens(&fixture.kv), 1);
 
-  const uint16_t* got_k0 = KVKTokenFP16(&fixture.kv, 0, 0);
-  const uint16_t* got_k1 = KVKTokenFP16(&fixture.kv, 1, 0);
+  const uint16_t* got_k0 = ReadKTokenFP16(&fixture.kv, 0, 0);
+  const uint16_t* got_k1 = ReadKTokenFP16(&fixture.kv, 1, 0);
   ASSERT_NE(got_k0, nullptr);
   ASSERT_NE(got_k1, nullptr);
   EXPECT_EQ(got_k0[0], 1);
@@ -204,39 +346,115 @@ TEST(KVCacheReservationTest, ReserveWriteCommitTokenFlow) {
 }
 
 TEST(KVCacheReservationTest, ReserveWriteCommitArgumentValidation) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/1, /*hidden=*/4, /*max_seq=*/4, /*max_prefix=*/0, /*recent_keep=*/4));
+  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/1, /*hidden=*/4, /*max_seq=*/4, /*max_prefix=*/0));
   int token = -1;
   ASSERT_EQ(KVReserveTokenSlot(&fixture.kv, &token), KV_OK);
   ASSERT_EQ(token, 0);
 
   std::array<uint16_t, 4> k = {1, 2, 3, 4};
   std::array<uint16_t, 4> v = {11, 12, 13, 14};
+  KVAttentionLayerArg write_arg{};
+  write_arg.dtype = KV_DTYPE_FP16;
+  write_arg.k_data = k.data();
+  write_arg.v_data = v.data();
 
-  EXPECT_EQ(KVWriteLayerToken(&fixture.kv, -1, token, k.data(), v.data(), sizeof(k)), KV_ERR_BAD_ARG);
-  EXPECT_EQ(KVWriteLayerToken(&fixture.kv, 0, -1, k.data(), v.data(), sizeof(k)), KV_ERR_BAD_ARG);
-  EXPECT_EQ(KVWriteLayerToken(&fixture.kv, 0, token, k.data(), v.data(), sizeof(uint16_t) * 3), KV_ERR_BAD_ARG);
+  EXPECT_EQ(KVAttentionWriteLayer(&fixture.kv, -1, token, &write_arg), KV_ERR_BAD_ARG);
+  EXPECT_EQ(KVAttentionWriteLayer(&fixture.kv, 0, -1, &write_arg), KV_ERR_BAD_ARG);
 }
 
-TEST(KVCacheReadSpanTest, ReadSpanExposesLayerData) {
-  KVFixture fixture = CreateFixture(MakeConfig(/*layers=*/2, /*hidden=*/4, /*max_seq=*/8, /*max_prefix=*/0, /*recent_keep=*/8));
+TEST(KVCacheAttentionLayerIOTest, LayerWriteAndLogicalReadFlow) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/2,
+      /*hidden=*/4,
+      /*max_seq=*/6,
+      /*max_prefix=*/1,
+      /*recent_keep=*/5,
+      /*use_ring=*/false));
 
-  std::array<uint16_t, 8> k = {11, 12, 13, 14, 21, 22, 23, 24};
-  std::array<uint16_t, 8> v = {31, 32, 33, 34, 41, 42, 43, 44};
-  ASSERT_EQ(KVAppend(&fixture.kv, k.data(), v.data()), KV_OK);
+  int token = -1;
+  ASSERT_EQ(KVReserveTokenSlot(&fixture.kv, &token), KV_OK);
+  ASSERT_EQ(token, 0);
 
-  KVLayerReadSpan read_span{};
-  ASSERT_EQ(KVGetLayerReadSpan(&fixture.kv, 1, &read_span), KV_OK);
-  EXPECT_EQ(read_span.token_count, 1);
-  EXPECT_EQ(read_span.token_stride_bytes, sizeof(uint16_t) * 4);
+  std::array<uint16_t, 4> k_l0 = {11, 12, 13, 14};
+  std::array<uint16_t, 4> v_l0 = {111, 112, 113, 114};
+  std::array<uint16_t, 4> k_l1 = {21, 22, 23, 24};
+  std::array<uint16_t, 4> v_l1 = {121, 122, 123, 124};
 
-  const uint16_t* layer1_k = static_cast<const uint16_t*>(read_span.k_base);
-  const uint16_t* layer1_v = static_cast<const uint16_t*>(read_span.v_base);
-  ASSERT_NE(layer1_k, nullptr);
-  ASSERT_NE(layer1_v, nullptr);
-  EXPECT_EQ(layer1_k[0], 21);
-  EXPECT_EQ(layer1_k[3], 24);
-  EXPECT_EQ(layer1_v[0], 41);
-  EXPECT_EQ(layer1_v[3], 44);
+  KVAttentionLayerArg write_l0{};
+  write_l0.dtype = KV_DTYPE_FP16;
+  write_l0.k_data = k_l0.data();
+  write_l0.v_data = v_l0.data();
+  KVAttentionLayerArg write_l1{};
+  write_l1.dtype = KV_DTYPE_FP16;
+  write_l1.k_data = k_l1.data();
+  write_l1.v_data = v_l1.data();
+
+  ASSERT_EQ(KVAttentionWriteLayer(&fixture.kv, 0, token, &write_l0), KV_OK);
+  ASSERT_EQ(KVAttentionWriteLayer(&fixture.kv, 1, token, &write_l1), KV_OK);
+  ASSERT_EQ(KVCommitToken(&fixture.kv, token), KV_OK);
+
+  KVAttentionLayerArg read_arg{};
+  read_arg.dtype = KV_DTYPE_FP16;
+
+  ASSERT_EQ(KVAttentionReadLayer(&fixture.kv, 0, /*logical_token=*/0, &read_arg), KV_OK);
+  const uint16_t* got_k = static_cast<const uint16_t*>(read_arg.k_data);
+  const uint16_t* got_v = static_cast<const uint16_t*>(read_arg.v_data);
+  ASSERT_NE(got_k, nullptr);
+  ASSERT_NE(got_v, nullptr);
+  EXPECT_EQ(got_k[0], 11);
+  EXPECT_EQ(got_k[3], 14);
+  EXPECT_EQ(got_v[0], 111);
+  EXPECT_EQ(got_v[3], 114);
+
+  ASSERT_EQ(KVAttentionReadLayer(&fixture.kv, 1, /*logical_token=*/0, &read_arg), KV_OK);
+  got_k = static_cast<const uint16_t*>(read_arg.k_data);
+  got_v = static_cast<const uint16_t*>(read_arg.v_data);
+  ASSERT_NE(got_k, nullptr);
+  ASSERT_NE(got_v, nullptr);
+  EXPECT_EQ(got_k[0], 21);
+  EXPECT_EQ(got_v[0], 121);
+}
+
+TEST(KVCacheAttentionLayerIOTest, ArgumentValidation) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/1,
+      /*hidden=*/4,
+      /*max_seq=*/4,
+      /*max_prefix=*/0,
+      /*recent_keep=*/4,
+      /*use_ring=*/false));
+
+  std::array<uint16_t, 4> k = {1, 2, 3, 4};
+  std::array<uint16_t, 4> v = {11, 12, 13, 14};
+  int token = -1;
+  ASSERT_EQ(KVReserveTokenSlot(&fixture.kv, &token), KV_OK);
+
+  KVAttentionLayerArg write_arg{};
+  write_arg.dtype = KV_DTYPE_FP16;
+  write_arg.k_data = k.data();
+  write_arg.v_data = v.data();
+  EXPECT_EQ(KVAttentionWriteLayer(nullptr, 0, token, &write_arg), KV_ERR_NULL);
+
+  KVAttentionLayerArg null_k_arg{};
+  null_k_arg.dtype = KV_DTYPE_FP16;
+  null_k_arg.k_data = nullptr;
+  null_k_arg.v_data = v.data();
+  EXPECT_EQ(KVAttentionWriteLayer(&fixture.kv, 0, token, &null_k_arg), KV_ERR_NULL);
+
+  KVAttentionLayerArg bad_dtype_arg{};
+  bad_dtype_arg.dtype = KV_DTYPE_INT8;
+  bad_dtype_arg.k_data = k.data();
+  bad_dtype_arg.v_data = v.data();
+  EXPECT_EQ(KVAttentionWriteLayer(&fixture.kv, 0, token, &bad_dtype_arg), KV_ERR_BAD_ARG);
+
+  KVAttentionLayerArg read_arg{};
+  read_arg.dtype = KV_DTYPE_FP16;
+  EXPECT_EQ(KVAttentionReadLayer(nullptr, 0, 0, &read_arg), KV_ERR_NULL);
+  EXPECT_EQ(KVAttentionReadLayer(&fixture.kv, 0, 0, nullptr), KV_ERR_NULL);
+  EXPECT_EQ(KVAttentionReadLayer(&fixture.kv, 0, /*logical_token=*/1, &read_arg), KV_ERR_BAD_ARG);
+
+  read_arg.dtype = KV_DTYPE_INT8;
+  EXPECT_EQ(KVAttentionReadLayer(&fixture.kv, 0, 0, &read_arg), KV_ERR_BAD_ARG);
 }
 
 TEST(KVCacheRingTest, InitWithRingPolicyStartsEmptyAndAppendWorks) {
@@ -280,11 +498,11 @@ TEST(KVCacheRingTest, PrefixAndRecentWrapMaintainLogicalOrder) {
   EXPECT_EQ(KVValidTokens(&fixture.kv), 5);
   EXPECT_EQ(KVBaseToken(&fixture.kv), 2);
 
-  const uint16_t* t0 = KVKTokenFP16(&fixture.kv, 0, 0);
-  const uint16_t* t1 = KVKTokenFP16(&fixture.kv, 0, 1);
-  const uint16_t* t2 = KVKTokenFP16(&fixture.kv, 0, 2);
-  const uint16_t* t3 = KVKTokenFP16(&fixture.kv, 0, 3);
-  const uint16_t* t4 = KVKTokenFP16(&fixture.kv, 0, 4);
+  const uint16_t* t0 = ReadKTokenFP16(&fixture.kv, 0, 0);
+  const uint16_t* t1 = ReadKTokenFP16(&fixture.kv, 0, 1);
+  const uint16_t* t2 = ReadKTokenFP16(&fixture.kv, 0, 2);
+  const uint16_t* t3 = ReadKTokenFP16(&fixture.kv, 0, 3);
+  const uint16_t* t4 = ReadKTokenFP16(&fixture.kv, 0, 4);
   ASSERT_NE(t0, nullptr);
   ASSERT_NE(t1, nullptr);
   ASSERT_NE(t2, nullptr);
@@ -297,10 +515,59 @@ TEST(KVCacheRingTest, PrefixAndRecentWrapMaintainLogicalOrder) {
   EXPECT_EQ(t3[0], 331);
   EXPECT_EQ(t4[0], 341);
 
-  KVReadView view{};
-  ASSERT_EQ(KVGetReadView(&fixture.kv, &view), KV_OK);
-  EXPECT_EQ(view.segment_count, 2);
-  EXPECT_EQ(view.segments[0].token_count + view.segments[1].token_count, 3);
+}
+
+TEST(KVCacheRingTest, SealPrefixBelowMaxPrefixExpandsRecentWindow) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/1,
+      /*hidden=*/2,
+      /*max_seq=*/6,
+      /*max_prefix=*/4,
+      /*recent_keep=*/2,
+      /*use_ring=*/true));
+
+  std::array<uint16_t, 2> p0 = {101, 102};
+  std::array<uint16_t, 2> p1 = {201, 202};
+  ASSERT_EQ(KVAppend(&fixture.kv, p0.data(), p0.data()), KV_OK);
+  ASSERT_EQ(KVAppend(&fixture.kv, p1.data(), p1.data()), KV_OK);
+  ASSERT_EQ(KVSealPrefix(&fixture.kv, 2), KV_OK);
+
+  KVAttentionView view{};
+  ASSERT_EQ(KVGetAttentionView(&fixture.kv, /*q_pos=*/2, &view), KV_OK);
+  EXPECT_EQ(view.prefix_tokens, 2);
+  EXPECT_EQ(view.recent_capacity, 4);  // max_seq - sealed_prefix = 6 - 2
+
+  for (int i = 0; i < 5; ++i) {
+    std::array<uint16_t, 2> tok = {
+        static_cast<uint16_t>(300 + i * 10 + 1),
+        static_cast<uint16_t>(300 + i * 10 + 2),
+    };
+    ASSERT_EQ(KVAppend(&fixture.kv, tok.data(), tok.data()), KV_OK);
+  }
+
+  EXPECT_EQ(KVValidTokens(&fixture.kv), 6);
+  EXPECT_EQ(KVBaseToken(&fixture.kv), 1);
+  EXPECT_EQ(KVRecentTokens(&fixture.kv), 4);
+
+  const uint16_t* t0 = ReadKTokenFP16(&fixture.kv, 0, 0);
+  const uint16_t* t1 = ReadKTokenFP16(&fixture.kv, 0, 1);
+  const uint16_t* t2 = ReadKTokenFP16(&fixture.kv, 0, 2);
+  const uint16_t* t3 = ReadKTokenFP16(&fixture.kv, 0, 3);
+  const uint16_t* t4 = ReadKTokenFP16(&fixture.kv, 0, 4);
+  const uint16_t* t5 = ReadKTokenFP16(&fixture.kv, 0, 5);
+  ASSERT_NE(t0, nullptr);
+  ASSERT_NE(t1, nullptr);
+  ASSERT_NE(t2, nullptr);
+  ASSERT_NE(t3, nullptr);
+  ASSERT_NE(t4, nullptr);
+  ASSERT_NE(t5, nullptr);
+
+  EXPECT_EQ(t0[0], 101);
+  EXPECT_EQ(t1[0], 201);
+  EXPECT_EQ(t2[0], 311);
+  EXPECT_EQ(t3[0], 321);
+  EXPECT_EQ(t4[0], 331);
+  EXPECT_EQ(t5[0], 341);
 }
 
 TEST(KVCacheAttentionViewTest, BuildsMetadataForNonRingPrefixAndRecent) {
@@ -327,14 +594,14 @@ TEST(KVCacheAttentionViewTest, BuildsMetadataForNonRingPrefixAndRecent) {
   EXPECT_EQ(view.recent_logical_start, 1);
   EXPECT_EQ(view.recent_size, 2);
   EXPECT_EQ(view.recent_capacity, 6);
-  EXPECT_EQ(view.recent_first_slot, 0);
-  EXPECT_EQ(view.recent_wrapped, 0);
+  EXPECT_EQ(view.recent_first_slot, 2);
+  EXPECT_FALSE(view.recent_wrapped);
   EXPECT_EQ(view.layer_stride_bytes, (size_t)8 * 4 * sizeof(uint16_t));
   EXPECT_EQ(view.token_stride_bytes, (size_t)4 * sizeof(uint16_t));
   EXPECT_EQ(view.k_base, fixture.kv.arena.k_data);
   EXPECT_EQ(view.v_base, fixture.kv.arena.v_data);
 
-  EXPECT_EQ(KVRecentFirstPhysicalSlot(&fixture.kv), 0);
+  EXPECT_EQ(KVRecentFirstPhysicalSlot(&fixture.kv), 2);
   EXPECT_EQ(KVRecentLogicalStart(&fixture.kv), 1);
 }
 
@@ -370,7 +637,7 @@ TEST(KVCacheAttentionViewTest, BuildsMetadataForRingWrappedWindow) {
   EXPECT_EQ(view.recent_size, 3);
   EXPECT_EQ(view.recent_capacity, 3);
   EXPECT_EQ(view.recent_first_slot, 2);
-  EXPECT_EQ(view.recent_wrapped, 1);
+  EXPECT_TRUE(view.recent_wrapped);
   EXPECT_EQ(KVRecentFirstPhysicalSlot(&fixture.kv), 2);
   EXPECT_EQ(KVRecentLogicalStart(&fixture.kv), 4);
 }

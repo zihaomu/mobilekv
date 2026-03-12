@@ -13,7 +13,7 @@ static KVConfig MakeConfig(int use_ring_buffer) {
   cfg.shape.max_seq = 6;
   cfg.policy.max_prefix_tokens = 2;
   cfg.policy.recent_keep = 4;
-  cfg.policy.use_ring_buffer = use_ring_buffer;
+  cfg.policy.use_ring_buffer = (use_ring_buffer != 0);
   cfg.dtype = KV_DTYPE_FP16;
   cfg.backend = KV_BACKEND_CPU;
   return cfg;
@@ -26,9 +26,8 @@ static void FillToken(uint16_t* out, int hidden, uint16_t base) {
 }
 
 static void RunAttentionUsageDemo(void) {
+  const int prefix_tokens = 2;
   KVConfig cfg = MakeConfig(/*use_ring_buffer=*/1);
-  cfg.policy.max_prefix_tokens = 2;
-  cfg.policy.recent_keep = 4;
 
   const size_t bytes = KVRequiredBytes(&cfg);
   void* arena = malloc(bytes);
@@ -43,7 +42,7 @@ static void RunAttentionUsageDemo(void) {
   assert(KVAppend(&kv, token, token) == KV_OK);
   FillToken(token, cfg.shape.hidden, 200);
   assert(KVAppend(&kv, token, token) == KV_OK);
-  assert(KVSealPrefix(&kv, 2) == KV_OK);
+  assert(KVSealPrefix(&kv, prefix_tokens) == KV_OK);
 
   for (int i = 0; i < 6; ++i) {
     FillToken(token, cfg.shape.hidden, (uint16_t)(300 + i * 10));
@@ -75,11 +74,11 @@ static void RunAttentionUsageDemo(void) {
 
   /*
    * Recent region uses ring slots. Attention kernel can reconstruct physical slot by:
-   * phys = max_prefix_tokens + (recent_first_slot + i) % recent_capacity.
+   * phys = prefix_tokens + (recent_first_slot + i) % recent_capacity.
    */
   for (int i = 0; i < view.recent_size; ++i) {
     int ring_slot = (view.recent_first_slot + i) % view.recent_capacity;
-    int phys = cfg.policy.max_prefix_tokens + ring_slot;
+    int phys = view.prefix_tokens + ring_slot;
     int logical = view.recent_logical_start + i;
     const uint16_t* k = (const uint16_t*)(k_base + layer0_off + (size_t)phys * view.token_stride_bytes);
     printf("[recent] logical=%d phys=%d k0=%u\n", logical, phys, (unsigned)k[0]);

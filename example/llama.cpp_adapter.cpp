@@ -36,7 +36,7 @@ static KVConfig MakeConfig(void) {
   cfg.shape.max_seq = 6;
   cfg.policy.max_prefix_tokens = 2;
   cfg.policy.recent_keep = 4;
-  cfg.policy.use_ring_buffer = 1;
+  cfg.policy.use_ring_buffer = true;
   cfg.dtype = KV_DTYPE_FP16;
   cfg.backend = KV_BACKEND_CPU;
   return cfg;
@@ -78,17 +78,18 @@ static int BuildLlamaAttentionMeta(
   return 1;
 }
 
-static int PhysicalSlotFromMeta(const KVConfig* cfg, const LlamaAttentionMeta* m, int logical_token) {
+static int PhysicalSlotFromMeta(const LlamaAttentionMeta* m, int logical_token) {
   if (logical_token < m->prefix_tokens) {
     return logical_token;
   }
 
   const int recent_idx = logical_token - m->prefix_tokens;
   const int ring_slot = (m->recent_first_slot + recent_idx) % m->recent_capacity;
-  return cfg->policy.max_prefix_tokens + ring_slot;
+  return m->prefix_tokens + ring_slot;
 }
 
 int main(void) {
+  const int prefix_tokens = 2;
   KVConfig cfg = MakeConfig();
   const size_t bytes = KVRequiredBytes(&cfg);
   void* arena = malloc(bytes);
@@ -102,7 +103,7 @@ int main(void) {
   assert(KVAppend(&kv, token, token) == KV_OK);
   FillToken(token, cfg.shape.hidden, 200);
   assert(KVAppend(&kv, token, token) == KV_OK);
-  assert(KVSealPrefix(&kv, 2) == KV_OK);
+  assert(KVSealPrefix(&kv, prefix_tokens) == KV_OK);
 
   for (int i = 0; i < 6; ++i) {
     FillToken(token, cfg.shape.hidden, (uint16_t)(300 + i * 10));
@@ -124,7 +125,7 @@ int main(void) {
          meta.recent_wrapped);
 
   for (int t = 0; t < meta.visible_tokens; ++t) {
-    const int phys = PhysicalSlotFromMeta(&cfg, &meta, t);
+    const int phys = PhysicalSlotFromMeta(&meta, t);
     const uint16_t* k = meta.k_layer_base + (size_t)phys * meta.token_stride_elems;
     printf("logical=%d phys=%d k0=%u\n", t, phys, (unsigned)k[0]);
   }

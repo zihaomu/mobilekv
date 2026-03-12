@@ -30,6 +30,11 @@ if(MOBILEKV_BUILD_EXAMPLES)
     example/llama.cpp_adapter.cpp
   )
   target_link_libraries(mobilekv_llama_adapter_demo PRIVATE mobilekv::mobilekv)
+
+  add_executable(mobilekv_attention_layer_submit_demo
+    example/attention_layer_submit_example.cpp
+  )
+  target_link_libraries(mobilekv_attention_layer_submit_demo PRIVATE mobilekv::mobilekv)
 endif()
 
 if(MOBILEKV_BUILD_BENCHMARKS)
