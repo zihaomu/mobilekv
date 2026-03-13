@@ -14,7 +14,8 @@ KVConfig MakeConfig(
     int max_seq,
     int max_prefix,
     int recent_keep = -1,
-    bool use_ring = false) {
+    bool use_ring = false,
+    KVDataType dtype = KV_DTYPE_FP16) {
   KVConfig cfg{};
   cfg.shape.layers = layers;
   cfg.shape.heads = 1;
@@ -24,7 +25,7 @@ KVConfig MakeConfig(
   cfg.policy.max_prefix_tokens = max_prefix;
   cfg.policy.recent_keep = (recent_keep >= 0) ? recent_keep : (max_seq - max_prefix);
   cfg.policy.use_ring_buffer = use_ring;
-  cfg.dtype = KV_DTYPE_FP16;
+  cfg.dtype = dtype;
   cfg.backend = KV_BACKEND_CPU;
   return cfg;
 }
@@ -51,6 +52,13 @@ const uint16_t* ReadKTokenFP16(const KVCache* kv, int layer, int logical_token) 
   return static_cast<const uint16_t*>(arg.k_data);
 }
 
+const int8_t* ReadKTokenINT8(const KVCache* kv, int layer, int logical_token) {
+  KVAttentionLayerArg arg{};
+  arg.dtype = KV_DTYPE_INT8;
+  if (KVAttentionReadLayer(kv, layer, logical_token, &arg) != KV_OK) return nullptr;
+  return static_cast<const int8_t*>(arg.k_data);
+}
+
 }  // namespace
 
 TEST(KVCacheLifecycleTest, RequiredBytesSanity) {
@@ -60,6 +68,9 @@ TEST(KVCacheLifecycleTest, RequiredBytesSanity) {
   EXPECT_EQ(KVRequiredBytes(nullptr), 0u);
 
   cfg.dtype = KV_DTYPE_INT8;
+  EXPECT_GT(KVRequiredBytes(&cfg), 0u);
+
+  cfg.dtype = KV_DTYPE_FP32;
   EXPECT_EQ(KVRequiredBytes(&cfg), 0u);
 }
 
@@ -168,6 +179,83 @@ TEST(KVCacheAppendTest, InitAndAppendRoundTrip) {
   EXPECT_EQ(k_l1_t0[0], 21);
   EXPECT_EQ(k_l1_t0[3], 24);
 
+}
+
+TEST(KVCacheInt8Test, AppendAndReadRoundTrip) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/2,
+      /*hidden=*/4,
+      /*max_seq=*/8,
+      /*max_prefix=*/0,
+      /*recent_keep=*/-1,
+      /*use_ring=*/false,
+      /*dtype=*/KV_DTYPE_INT8));
+
+  std::array<int8_t, 8> k = {1, 2, 3, 4, 21, 22, 23, 24};
+  std::array<int8_t, 8> v = {11, 12, 13, 14, 31, 32, 33, 34};
+
+  ASSERT_EQ(KVAppend(&fixture.kv, k.data(), v.data()), KV_OK);
+  EXPECT_EQ(KVDType(&fixture.kv), KV_DTYPE_INT8);
+  EXPECT_EQ(KVValidTokens(&fixture.kv), 1);
+
+  const int8_t* k_l0_t0 = ReadKTokenINT8(&fixture.kv, 0, 0);
+  const int8_t* k_l1_t0 = ReadKTokenINT8(&fixture.kv, 1, 0);
+  ASSERT_NE(k_l0_t0, nullptr);
+  ASSERT_NE(k_l1_t0, nullptr);
+  EXPECT_EQ(k_l0_t0[0], 1);
+  EXPECT_EQ(k_l0_t0[3], 4);
+  EXPECT_EQ(k_l1_t0[0], 21);
+  EXPECT_EQ(k_l1_t0[3], 24);
+}
+
+TEST(KVCacheInt8Test, ReserveWriteCommitAndReadRoundTrip) {
+  KVFixture fixture = CreateFixture(MakeConfig(
+      /*layers=*/2,
+      /*hidden=*/4,
+      /*max_seq=*/8,
+      /*max_prefix=*/0,
+      /*recent_keep=*/-1,
+      /*use_ring=*/false,
+      /*dtype=*/KV_DTYPE_INT8));
+
+  int token = -1;
+  ASSERT_EQ(KVReserveTokenSlot(&fixture.kv, &token), KV_OK);
+
+  std::array<int8_t, 4> k_l0 = {1, 2, 3, 4};
+  std::array<int8_t, 4> v_l0 = {11, 12, 13, 14};
+  std::array<int8_t, 4> k_l1 = {21, 22, 23, 24};
+  std::array<int8_t, 4> v_l1 = {31, 32, 33, 34};
+
+  KVAttentionLayerArg write_l0{};
+  write_l0.dtype = KV_DTYPE_INT8;
+  write_l0.k_data = k_l0.data();
+  write_l0.v_data = v_l0.data();
+  KVAttentionLayerArg write_l1{};
+  write_l1.dtype = KV_DTYPE_INT8;
+  write_l1.k_data = k_l1.data();
+  write_l1.v_data = v_l1.data();
+
+  ASSERT_EQ(KVAttentionWriteLayer(&fixture.kv, 0, token, &write_l0), KV_OK);
+  ASSERT_EQ(KVAttentionWriteLayer(&fixture.kv, 1, token, &write_l1), KV_OK);
+  ASSERT_EQ(KVCommitToken(&fixture.kv, token), KV_OK);
+
+  KVAttentionLayerArg read_arg{};
+  read_arg.dtype = KV_DTYPE_INT8;
+  ASSERT_EQ(KVAttentionReadLayer(&fixture.kv, 0, 0, &read_arg), KV_OK);
+  const int8_t* got_k0 = static_cast<const int8_t*>(read_arg.k_data);
+  const int8_t* got_v0 = static_cast<const int8_t*>(read_arg.v_data);
+  ASSERT_NE(got_k0, nullptr);
+  ASSERT_NE(got_v0, nullptr);
+  EXPECT_EQ(got_k0[0], 1);
+  EXPECT_EQ(got_v0[0], 11);
+
+  ASSERT_EQ(KVAttentionReadLayer(&fixture.kv, 1, 0, &read_arg), KV_OK);
+  const int8_t* got_k1 = static_cast<const int8_t*>(read_arg.k_data);
+  const int8_t* got_v1 = static_cast<const int8_t*>(read_arg.v_data);
+  ASSERT_NE(got_k1, nullptr);
+  ASSERT_NE(got_v1, nullptr);
+  EXPECT_EQ(got_k1[0], 21);
+  EXPECT_EQ(got_v1[0], 31);
 }
 
 TEST(KVCacheCompactionTest, CompactKeepsPrefixAndRecentWindow) {

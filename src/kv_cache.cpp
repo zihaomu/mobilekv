@@ -9,7 +9,20 @@ static size_t kv_align_up(size_t v) {
   return (v + KV_ALIGN - 1) & ~(KV_ALIGN - 1);
 }
 
+static size_t kv_dtype_elem_bytes(KVDataType dtype) {
+  switch (dtype) {
+    case KV_DTYPE_FP16:
+      return sizeof(uint16_t);
+    case KV_DTYPE_INT8:
+      return sizeof(int8_t);
+    default:
+      return 0;
+  }
+}
+
 static int kv_valid_config(const KVConfig* c) {
+  const size_t elem_bytes = c ? kv_dtype_elem_bytes(c->dtype) : 0;
+
   if (!c) return 0;
   if (c->shape.layers <= 0) return 0;
   if (c->shape.heads <= 0) return 0;
@@ -20,7 +33,7 @@ static int kv_valid_config(const KVConfig* c) {
   if (c->policy.recent_keep < 0) return 0;
   if (c->policy.max_prefix_tokens > c->shape.max_seq) return 0;
   if (c->policy.max_prefix_tokens + c->policy.recent_keep > c->shape.max_seq) return 0;
-  if (c->dtype != KV_DTYPE_FP16) return 0; /* v2 implements fp16 only */
+  if (elem_bytes == 0) return 0;
   if (c->backend != KV_BACKEND_CPU) return 0;
   return 1;
 }
@@ -67,8 +80,12 @@ static int kv_prefix_tokens_runtime(const KVCache* kv) {
   return kv->state.prefix_frozen ? kv->state.prefix_tokens : 0;
 }
 
+static size_t kv_elem_bytes(const KVCache* kv) {
+  return kv_dtype_elem_bytes(kv->config.dtype);
+}
+
 static size_t kv_token_bytes(const KVCache* kv) {
-  return (size_t)kv->config.shape.hidden * sizeof(uint16_t);
+  return (size_t)kv->config.shape.hidden * kv_elem_bytes(kv);
 }
 
 /* logical token index [0, valid_tokens) -> physical token slot [0, max_seq) */
@@ -101,8 +118,9 @@ static int kv_logical_to_physical(const KVCache* kv, int logical_token) {
 }
 
 size_t KVRequiredBytes(const KVConfig* config) {
+  const size_t elem_bytes = config ? kv_dtype_elem_bytes(config->dtype) : 0;
   if (!kv_valid_config(config)) return 0;
-  const size_t t = kv_tensor_bytes(&config->shape, sizeof(uint16_t));
+  const size_t t = kv_tensor_bytes(&config->shape, elem_bytes);
   return KV_ALIGN + kv_align_up(t) + kv_align_up(t);
 }
 
@@ -146,7 +164,7 @@ KVStatus KVInitPreallocated(
   kv->owns_arena = 0;
 
   p = (uint8_t*)kv_align_up((size_t)arena_base);
-  t = kv_tensor_bytes(&config->shape, sizeof(uint16_t));
+  t = kv_tensor_bytes(&config->shape, kv_dtype_elem_bytes(config->dtype));
 
   kv->arena.k_data = p;
   kv->arena.k_bytes = t;
@@ -228,8 +246,8 @@ KVStatus KVSealPrefix(
   bytes = kv_token_bytes(kv);
 
   for (l = 0; l < kv->config.shape.layers; ++l) {
-    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, sizeof(uint16_t));
-    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, sizeof(uint16_t));
+    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, kv_elem_bytes(kv));
+    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, kv_elem_bytes(kv));
 
     if (keep_recent > 0 && src_recent != dst_recent) {
       memmove(k + (size_t)dst_recent * bytes,
@@ -290,8 +308,8 @@ KVStatus KVCompact(KVCache* kv) {
   bytes = kv_token_bytes(kv);
 
   for (l = 0; l < kv->config.shape.layers; ++l) {
-    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, sizeof(uint16_t));
-    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, sizeof(uint16_t));
+    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, kv_elem_bytes(kv));
+    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, kv_elem_bytes(kv));
 
     if (keep_recent > 0 && src_recent != dst_recent) {
       memmove(k + (size_t)dst_recent * bytes,
@@ -340,8 +358,8 @@ static KVStatus kv_non_ring_make_room_for_append(KVCache* kv) {
   bytes = kv_token_bytes(kv);
 
   for (l = 0; l < kv->config.shape.layers; ++l) {
-    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, sizeof(uint16_t));
-    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, sizeof(uint16_t));
+    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, kv_elem_bytes(kv));
+    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, kv_elem_bytes(kv));
     if (keep_recent > 0) {
       memmove(k + (size_t)recent_base * bytes,
               k + (size_t)(recent_base + 1) * bytes,
@@ -359,7 +377,7 @@ static KVStatus kv_non_ring_make_room_for_append(KVCache* kv) {
   return KV_OK;
 }
 
-static KVStatus kv_append_fp16_contiguous(
+static KVStatus kv_append_contiguous(
     KVCache* kv,
     const void* new_k_layers,
     const void* new_v_layers,
@@ -389,8 +407,8 @@ static KVStatus kv_append_fp16_contiguous(
   }
 
   for (l = 0; l < layers; ++l) {
-    uint8_t* dst_k = kv_token_ptr_mut(kv, kv->arena.k_data, l, phys_slot, sizeof(uint16_t));
-    uint8_t* dst_v = kv_token_ptr_mut(kv, kv->arena.v_data, l, phys_slot, sizeof(uint16_t));
+    uint8_t* dst_k = kv_token_ptr_mut(kv, kv->arena.k_data, l, phys_slot, kv_elem_bytes(kv));
+    uint8_t* dst_v = kv_token_ptr_mut(kv, kv->arena.v_data, l, phys_slot, kv_elem_bytes(kv));
     const uint8_t* src_k = (const uint8_t*)new_k_layers + (size_t)l * layer_stride_bytes;
     const uint8_t* src_v = (const uint8_t*)new_v_layers + (size_t)l * layer_stride_bytes;
     memcpy(dst_k, src_k, bytes);
@@ -436,15 +454,16 @@ KVStatus KVAppend(
     KVCache* kv,
     const void* new_k_layers,
     const void* new_v_layers) {
+  const size_t elem_bytes = kv ? kv_elem_bytes(kv) : 0;
   if (!kv || !new_k_layers || !new_v_layers) return KV_ERR_NULL;
   if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (kv->config.dtype != KV_DTYPE_FP16) return KV_ERR_UNSUPPORTED;
+  if (elem_bytes == 0) return KV_ERR_UNSUPPORTED;
 
-  return kv_append_fp16_contiguous(
+  return kv_append_contiguous(
       kv,
       new_k_layers,
       new_v_layers,
-      (size_t)kv->config.shape.hidden * sizeof(uint16_t));
+      (size_t)kv->config.shape.hidden * elem_bytes);
 }
 
 KVStatus KVAppendViewWrite(
@@ -454,7 +473,7 @@ KVStatus KVAppendViewWrite(
   if (!view->k || !view->v) return KV_ERR_NULL;
   if (view->layer_stride_bytes < kv_token_bytes(kv)) return KV_ERR_BAD_ARG;
 
-  return kv_append_fp16_contiguous(
+  return kv_append_contiguous(
       kv,
       view->k,
       view->v,
@@ -465,7 +484,7 @@ KVStatus KVReserveTokenSlot(KVCache* kv, int* out_token) {
   int phys_slot;
   if (!kv || !out_token) return KV_ERR_NULL;
   if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (kv->config.dtype != KV_DTYPE_FP16) return KV_ERR_UNSUPPORTED;
+  if (kv_elem_bytes(kv) == 0) return KV_ERR_UNSUPPORTED;
 
   if (!kv->config.policy.use_ring_buffer) {
     KVStatus st;
@@ -535,49 +554,51 @@ KVStatus KVCommitToken(KVCache* kv, int token) {
   return KV_OK;
 }
 
-static KVStatus KVAttentionWriteLayerFP16(
+static KVStatus kv_attention_write_layer_raw(
     KVCache* kv,
     int layer,
     int token,
-    const uint16_t* k_data,
-    const uint16_t* v_data) {
+    const void* k_data,
+    const void* v_data) {
   const size_t bytes = kv_token_bytes(kv);
+  const size_t elem_bytes = kv_elem_bytes(kv);
   uint8_t* dst_k;
   uint8_t* dst_v;
 
   if (!kv || !k_data || !v_data) return KV_ERR_NULL;
   if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (kv->config.dtype != KV_DTYPE_FP16) return KV_ERR_UNSUPPORTED;
+  if (elem_bytes == 0) return KV_ERR_UNSUPPORTED;
   if (layer < 0 || layer >= kv->config.shape.layers) return KV_ERR_BAD_ARG;
   if (token < 0 || token >= kv->config.shape.max_seq) return KV_ERR_BAD_ARG;
 
-  dst_k = kv_token_ptr_mut(kv, kv->arena.k_data, layer, token, sizeof(uint16_t));
-  dst_v = kv_token_ptr_mut(kv, kv->arena.v_data, layer, token, sizeof(uint16_t));
+  dst_k = kv_token_ptr_mut(kv, kv->arena.k_data, layer, token, elem_bytes);
+  dst_v = kv_token_ptr_mut(kv, kv->arena.v_data, layer, token, elem_bytes);
   memcpy(dst_k, k_data, bytes);
   memcpy(dst_v, v_data, bytes);
   return KV_OK;
 }
 
-static KVStatus KVAttentionReadLayerFP16(
+static KVStatus kv_attention_read_layer_raw(
     const KVCache* kv,
     int layer,
     int logical_token,
-    const uint16_t** out_k,
-    const uint16_t** out_v) {
+    const void** out_k,
+    const void** out_v) {
+  const size_t elem_bytes = kv ? kv_elem_bytes(kv) : 0;
   int phys;
-  const uint16_t* k;
-  const uint16_t* v;
+  const void* k;
+  const void* v;
 
   if (!kv || !out_k || !out_v) return KV_ERR_NULL;
   if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (kv->config.dtype != KV_DTYPE_FP16) return KV_ERR_UNSUPPORTED;
+  if (elem_bytes == 0) return KV_ERR_UNSUPPORTED;
   if (layer < 0 || layer >= kv->config.shape.layers) return KV_ERR_BAD_ARG;
   if (logical_token < 0 || logical_token >= kv->state.valid_tokens) return KV_ERR_BAD_ARG;
 
   phys = kv_logical_to_physical(kv, logical_token);
   if (phys < 0) return KV_ERR_BAD_ARG;
-  k = (const uint16_t*)kv_token_ptr_const(kv, kv->arena.k_data, layer, phys, sizeof(uint16_t));
-  v = (const uint16_t*)kv_token_ptr_const(kv, kv->arena.v_data, layer, phys, sizeof(uint16_t));
+  k = (const void*)kv_token_ptr_const(kv, kv->arena.k_data, layer, phys, elem_bytes);
+  v = (const void*)kv_token_ptr_const(kv, kv->arena.v_data, layer, phys, elem_bytes);
 
   *out_k = k;
   *out_v = v;
@@ -595,14 +616,19 @@ KVStatus KVAttentionWriteLayer(
 
   switch (arg->dtype) {
     case KV_DTYPE_FP16:
-      return KVAttentionWriteLayerFP16(
+      return kv_attention_write_layer_raw(
           kv,
           layer,
           token,
-          (const uint16_t*)arg->k_data,
-          (const uint16_t*)arg->v_data);
+          arg->k_data,
+          arg->v_data);
     case KV_DTYPE_INT8:
-      return KV_ERR_UNSUPPORTED;
+      return kv_attention_write_layer_raw(
+          kv,
+          layer,
+          token,
+          arg->k_data,
+          arg->v_data);
     default:
       return KV_ERR_BAD_ARG;
   }
@@ -613,8 +639,8 @@ KVStatus KVAttentionReadLayer(
     int layer,
     int logical_token,
     KVAttentionLayerArg* arg) {
-  const uint16_t* k;
-  const uint16_t* v;
+  const void* k;
+  const void* v;
   KVStatus st;
 
   if (!kv || !arg) return KV_ERR_NULL;
@@ -625,13 +651,19 @@ KVStatus KVAttentionReadLayer(
     case KV_DTYPE_FP16:
       k = 0;
       v = 0;
-      st = KVAttentionReadLayerFP16(kv, layer, logical_token, &k, &v);
+      st = kv_attention_read_layer_raw(kv, layer, logical_token, &k, &v);
       if (st != KV_OK) return st;
       arg->k_data = k;
       arg->v_data = v;
       return KV_OK;
     case KV_DTYPE_INT8:
-      return KV_ERR_UNSUPPORTED;
+      k = 0;
+      v = 0;
+      st = kv_attention_read_layer_raw(kv, layer, logical_token, &k, &v);
+      if (st != KV_OK) return st;
+      arg->k_data = k;
+      arg->v_data = v;
+      return KV_OK;
     default:
       return KV_ERR_BAD_ARG;
   }
@@ -744,11 +776,11 @@ KVStatus KVGetAttentionView(
     view->layer_stride_bytes =
         kv->config.shape.max_seq *
         kv->config.shape.hidden *
-        (kv->config.dtype == KV_DTYPE_FP16 ? 2 : 1);
+        kv_elem_bytes(kv);
 
     view->token_stride_bytes =
         kv->config.shape.hidden *
-        (kv->config.dtype == KV_DTYPE_FP16 ? 2 : 1);
+        kv_elem_bytes(kv);
 
     return KV_OK;
 }
