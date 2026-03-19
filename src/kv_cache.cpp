@@ -1,9 +1,28 @@
 #include "mobilekv/kv_cache.h"
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <algorithm>
 
 namespace mobilekv {
+
+namespace {
+
+bool is_valid_alignment(size_t alignment) {
+    if (alignment == 0) {
+        return false;
+    }
+    if ((alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    return alignment >= alignof(void*);
+}
+
+size_t align_up(size_t size, size_t alignment) {
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+}  // namespace
 
 // ============================================================================
 // KVPlane 实现
@@ -13,13 +32,17 @@ class KVPlaneImpl : public KVPlane {
 public:
     KVPlaneImpl(LayerId layer_id, PlaneKind kind, std::shared_ptr<KVTemplate> templ,
                 uint32_t max_seq_capacity = 0)
-        : layer_id_(layer_id), kind_(kind), templ_(std::move(templ)) {
+        : layer_id_(layer_id)
+        , kind_(kind)
+        , templ_(std::move(templ))
+        , data_(nullptr, &std::free) {
         stats_.bytes_allocated = 0;
         stats_.seq_capacity = 0;
         stats_.seq_length = 0;
         stats_.max_seq_capacity = max_seq_capacity;
         stats_.is_ring_buffer = (max_seq_capacity > 0);
         stats_.write_head = 0;
+        oldest_seq_ = 0;
     }
 
     PlaneKind kind() const override { return kind_; }
@@ -43,8 +66,12 @@ public:
 
         // 对齐到模板要求的alignment
         size_t alignment = templ_->config().alignment;
-        if (alignment > 0) {
-            new_bytes = (new_bytes + alignment - 1) & ~(alignment - 1);
+        if (!is_valid_alignment(alignment)) {
+            return false;
+        }
+        new_bytes = align_up(new_bytes, alignment);
+        if (new_bytes == 0) {
+            return false;
         }
 
         // 分配新内存
@@ -58,7 +85,7 @@ public:
             std::memcpy(new_data, data_.get(), stats_.bytes_allocated);
         }
 
-        data_ = std::unique_ptr<Byte[]>(new_data);
+        data_.reset(new_data);
         stats_.bytes_allocated = new_bytes;
         stats_.seq_capacity = actual_capacity;
 
@@ -79,6 +106,14 @@ public:
             }
         }
         stats_.seq_length = target_seq_length;
+        if (stats_.is_ring_buffer) {
+            oldest_seq_ = 0;
+            if (stats_.max_seq_capacity > 0) {
+                stats_.write_head = target_seq_length % stats_.max_seq_capacity;
+            } else {
+                stats_.write_head = 0;
+            }
+        }
         return true;
     }
 
@@ -96,40 +131,53 @@ public:
     // Ring buffer模式的追加实现
     bool append_seq_ring_buffer(uint32_t token_count) {
         uint32_t max_len = stats_.max_seq_capacity;
+        if (max_len == 0) {
+            return false;
+        }
+        if (token_count == 0) {
+            return true;
+        }
+
+        if (stats_.seq_capacity < max_len) {
+            if (!reserve_seq(max_len)) {
+                return false;
+            }
+        }
 
         if (token_count > max_len) {
             // 追加的token比buffer还大，直接从新token开始
             stats_.write_head = 0;
             stats_.seq_length = max_len;
-            return reserve_seq(max_len);
+            oldest_seq_ = 0;
+            return true;
         }
 
         uint32_t current_len = stats_.seq_length;
+        uint32_t overflow = 0;
 
         if (current_len < max_len) {
             // 还没填满buffer，正常追加
             uint32_t new_length = std::min(current_len + token_count, max_len);
-            if (new_length > stats_.seq_capacity) {
-                if (!reserve_seq(max_len)) {
-                    return false;
-                }
+            if (current_len + token_count > max_len) {
+                overflow = current_len + token_count - max_len;
             }
             stats_.seq_length = new_length;
             // 更新write_head
             stats_.write_head = (stats_.write_head + token_count) % max_len;
         } else {
             // Buffer已满，覆盖最旧的token
-            // write_head指向最新数据的起始位置，覆盖时会写入该位置
-            // 逻辑起始位置 = (write_head) % max_len（数据是循环的）
+            overflow = token_count;
             stats_.write_head = (stats_.write_head + token_count) % max_len;
             // seq_length保持为max_len
         }
+        oldest_seq_ = (oldest_seq_ + overflow) % max_len;
 
         return true;
     }
 
     void clear() override {
         stats_.seq_length = 0;
+        oldest_seq_ = 0;
         if (stats_.is_ring_buffer) {
             stats_.write_head = 0;
         }
@@ -144,8 +192,17 @@ public:
     }
 
     PhysicalAddr locate(const LogicalCoord& coord) const override {
+        const auto& shape = templ_->shape();
+        if (coord.head >= shape.num_heads || coord.dim >= shape.head_dim) {
+            return PhysicalAddr();
+        }
+        if (coord.seq >= stats_.seq_length) {
+            return PhysicalAddr();
+        }
+
         LogicalCoord adjusted_coord = coord;
         adjusted_coord.layer = layer_id_;
+        adjusted_coord.seq = logical_to_physical_seq(coord.seq);
         return templ_->locate(adjusted_coord);
     }
 
@@ -159,17 +216,31 @@ public:
         view.seq_len = seq_len;
         view.templ = templ_.get();
 
-        if (seq_begin + seq_len > stats_.seq_length) {
+        if (seq_len == 0) {
+            view.contiguous = true;
+            view.base = data_.get();
+            view.bytes = 0;
+            return view;
+        }
+
+        if (seq_begin > stats_.seq_length || seq_len > (stats_.seq_length - seq_begin)) {
             return view;  // 返回空的view
         }
 
-        // 检查是否可以连续访问
-        bool can_contiguous = templ_->can_export_contiguous_span(seq_begin, seq_len);
+        uint32_t physical_begin_seq = logical_to_physical_seq(seq_begin);
+        bool wraps_ring = range_wraps_ring(seq_begin, seq_len);
+
+        // 检查是否可以连续访问。
+        bool can_contiguous = !wraps_ring &&
+                              templ_->can_export_contiguous_span(physical_begin_seq, seq_len);
 
         if (can_contiguous) {
+            size_t begin_offset = 0;
+            size_t view_bytes = 0;
+            if (!compute_span_byte_range(seq_begin, seq_len, begin_offset, view_bytes)) {
+                return AccessView();
+            }
             view.contiguous = true;
-            size_t begin_offset = templ_->bytes_for_tokens(seq_begin);
-            size_t view_bytes = templ_->bytes_for_tokens(seq_len);
             view.base = data_.get() + begin_offset;
             view.bytes = view_bytes;
         } else {
@@ -188,11 +259,72 @@ public:
     }
 
 private:
+    uint32_t logical_to_physical_seq(uint32_t seq) const {
+        if (!stats_.is_ring_buffer || stats_.max_seq_capacity == 0) {
+            return seq;
+        }
+        if (stats_.seq_length < stats_.max_seq_capacity) {
+            return seq;
+        }
+        return (oldest_seq_ + seq) % stats_.max_seq_capacity;
+    }
+
+    bool range_wraps_ring(uint32_t seq_begin, uint32_t seq_len) const {
+        if (!stats_.is_ring_buffer || stats_.max_seq_capacity == 0) {
+            return false;
+        }
+        if (stats_.seq_length < stats_.max_seq_capacity || seq_len == 0) {
+            return false;
+        }
+        uint32_t physical_begin = logical_to_physical_seq(seq_begin);
+        uint32_t physical_last = logical_to_physical_seq(seq_begin + seq_len - 1);
+        return physical_begin > physical_last;
+    }
+
+    bool compute_span_byte_range(uint32_t seq_begin, uint32_t seq_len,
+                                 size_t& begin_offset, size_t& span_bytes) const {
+        if (seq_len == 0) {
+            begin_offset = 0;
+            span_bytes = 0;
+            return true;
+        }
+        if (!data_) {
+            return false;
+        }
+
+        const auto& shape = templ_->shape();
+        if (shape.num_heads == 0 || shape.head_dim == 0) {
+            return false;
+        }
+
+        uint32_t physical_begin = logical_to_physical_seq(seq_begin);
+        uint32_t physical_last = logical_to_physical_seq(seq_begin + seq_len - 1);
+
+        LogicalCoord begin_coord(layer_id_, physical_begin, 0, 0);
+        LogicalCoord end_coord(layer_id_, physical_last, shape.num_heads - 1, shape.head_dim - 1);
+
+        PhysicalAddr begin = templ_->locate(begin_coord);
+        PhysicalAddr end = templ_->locate(end_coord);
+        if (!begin.valid || !end.valid) {
+            return false;
+        }
+
+        size_t end_exclusive = end.byte_offset + end.byte_size;
+        if (end_exclusive < begin.byte_offset) {
+            return false;
+        }
+
+        begin_offset = begin.byte_offset;
+        span_bytes = end_exclusive - begin.byte_offset;
+        return true;
+    }
+
     LayerId layer_id_;
     PlaneKind kind_;
     std::shared_ptr<KVTemplate> templ_;
-    std::unique_ptr<Byte[]> data_;
+    std::unique_ptr<Byte, void(*)(void*)> data_;
     PlaneStats stats_;
+    uint32_t oldest_seq_ = 0;
 };
 
 // ============================================================================
@@ -299,15 +431,26 @@ public:
             return false;
         }
 
+        if (spec.k_spec.max_seq_capacity > 0 &&
+            spec.k_spec.initial_seq_capacity > spec.k_spec.max_seq_capacity) {
+            return false;
+        }
+        if (spec.v_spec.max_seq_capacity > 0 &&
+            spec.v_spec.initial_seq_capacity > spec.v_spec.max_seq_capacity) {
+            return false;
+        }
+
         // 获取max_seq_capacity（K和V使用相同的值）
         uint32_t max_seq_capacity = std::max(spec.k_spec.max_seq_capacity, spec.v_spec.max_seq_capacity);
+        uint32_t initial_seq_capacity =
+            std::max(spec.k_spec.initial_seq_capacity, spec.v_spec.initial_seq_capacity);
 
         // 创建新的layer storage
         auto layer = std::make_unique<LayerStorageImpl>(
             spec.layer_id,
             k_it->second,
             v_it->second,
-            spec.k_spec.initial_seq_capacity,
+            initial_seq_capacity,
             max_seq_capacity
         );
 
@@ -396,7 +539,8 @@ KVCacheStorageBuilder& KVCacheStorageBuilder::add_layer(
     TemplateId v_template,
     uint32_t initial_seq_capacity
 ) {
-    return add_layer(layer, k_template, v_template, initial_seq_capacity, 0);
+    return add_layer(layer, k_template, v_template, initial_seq_capacity,
+                     config_.default_max_seq_capacity);
 }
 
 KVCacheStorageBuilder& KVCacheStorageBuilder::add_layer(

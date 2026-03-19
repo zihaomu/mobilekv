@@ -210,8 +210,10 @@ void benchmark_random_access(BenchmarkResult& result) {
     (void)sum;
 }
 
-void benchmark_multi_layer_append(BenchmarkResult& result) {
+void benchmark_multi_layer_append_ring(BenchmarkResult& result) {
     KVCacheStorageBuilder builder;
+    // 端侧默认：4参数add_layer走固定窗口ring，避免decode扩容抖动。
+    builder.config({64, false, BENCH_MAX_SEQ});
     auto templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(
         BENCH_NUM_HEADS, BENCH_HEAD_DIM, 1, "bench_fp16");
     builder.add_template(templ);
@@ -224,6 +226,36 @@ void benchmark_multi_layer_append(BenchmarkResult& result) {
 
     const uint32_t num_tokens = 512;
     const uint32_t num_iterations = 100;
+
+    BenchmarkTimer timer;
+    timer.start();
+
+    for (uint32_t iter = 0; iter < num_iterations; ++iter) {
+        storage->append_all(num_tokens);
+    }
+
+    result.time_ms = timer.stop();
+    result.operations = num_iterations * num_tokens * BENCH_NUM_LAYERS * 2;  // K and V
+    result.ops_per_sec = result.operations / (result.time_ms / 1000.0);
+    result.ns_per_op = (result.time_ms * 1000000.0) / result.operations;
+}
+
+void benchmark_multi_layer_append_growth(BenchmarkResult& result) {
+    KVCacheStorageBuilder builder;
+    auto templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(
+        BENCH_NUM_HEADS, BENCH_HEAD_DIM, 1, "bench_fp16_growth");
+    builder.add_template(templ);
+
+    for (uint32_t layer = 0; layer < BENCH_NUM_LAYERS; ++layer) {
+        // 4参数接口 + default_max_seq_capacity=0 => 非ring增长模式
+        builder.add_layer(layer, 1, 1, BENCH_MAX_SEQ);
+    }
+
+    auto storage = builder.build();
+
+    // 为了可观测扩容而不让benchmark耗时过长，使用小规模压力参数
+    const uint32_t num_tokens = 128;
+    const uint32_t num_iterations = 24;  // final length = 3072 (> 2048)
 
     BenchmarkTimer timer;
     timer.start();
@@ -321,8 +353,9 @@ void benchmark_acquire_view(BenchmarkResult& result) {
     result.ns_per_op = (result.time_ms * 1000000.0) / result.operations;
 }
 
-void benchmark_mixed_precision(BenchmarkResult& result) {
+void benchmark_mixed_precision_ring(BenchmarkResult& result) {
     KVCacheStorageBuilder builder;
+    builder.config({64, false, BENCH_MAX_SEQ});
 
     auto fp32_templ = std::make_shared<PlainKVTemplate<ScalarType::FP32>>(16, 64, 1, "fp32");
     auto fp16_templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(16, 64, 2, "fp16");
@@ -339,6 +372,39 @@ void benchmark_mixed_precision(BenchmarkResult& result) {
     auto storage = builder.build();
 
     const uint32_t num_ops = 10000;
+
+    BenchmarkTimer timer;
+    timer.start();
+
+    for (uint32_t i = 0; i < num_ops; ++i) {
+        storage->append_all(1);
+    }
+
+    result.time_ms = timer.stop();
+    result.operations = num_ops * 3 * 2;  // 3 layers, K and V each
+    result.ops_per_sec = result.operations / (result.time_ms / 1000.0);
+    result.ns_per_op = (result.time_ms * 1000000.0) / result.operations;
+}
+
+void benchmark_mixed_precision_growth(BenchmarkResult& result) {
+    KVCacheStorageBuilder builder;
+
+    auto fp32_templ = std::make_shared<PlainKVTemplate<ScalarType::FP32>>(16, 64, 1, "fp32");
+    auto fp16_templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(16, 64, 2, "fp16");
+    auto int8_templ = std::make_shared<PlainKVTemplate<ScalarType::INT8>>(16, 64, 3, "int8");
+
+    builder.add_template(fp32_templ);
+    builder.add_template(fp16_templ);
+    builder.add_template(int8_templ);
+
+    // 非ring增长模式：默认max_seq_capacity=0
+    builder.add_layer(0, 1, 1, 1024);
+    builder.add_layer(1, 2, 2, 1024);
+    builder.add_layer(2, 3, 3, 1024);
+
+    auto storage = builder.build();
+
+    const uint32_t num_ops = 1500;  // 触发扩容但保持可接受运行时间
 
     BenchmarkTimer timer;
     timer.start();
@@ -416,8 +482,15 @@ int main() {
 
     {
         BenchmarkResult r;
-        r.name = "Multi-layer Append";
-        benchmark_multi_layer_append(r);
+        r.name = "Multi-layer Append (Ring)";
+        benchmark_multi_layer_append_ring(r);
+        print_result(r);
+    }
+
+    {
+        BenchmarkResult r;
+        r.name = "Multi-layer Append (Growth)";
+        benchmark_multi_layer_append_growth(r);
         print_result(r);
     }
 
@@ -444,8 +517,15 @@ int main() {
 
     {
         BenchmarkResult r;
-        r.name = "Mixed Precision";
-        benchmark_mixed_precision(r);
+        r.name = "Mixed Precision (Ring)";
+        benchmark_mixed_precision_ring(r);
+        print_result(r);
+    }
+
+    {
+        BenchmarkResult r;
+        r.name = "Mixed Precision (Growth)";
+        benchmark_mixed_precision_growth(r);
         print_result(r);
     }
 

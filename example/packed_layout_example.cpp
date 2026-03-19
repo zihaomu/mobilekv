@@ -91,7 +91,11 @@ int main() {
         std::cout << "For " << seq_len << " tokens:" << std::endl;
         std::cout << "  Plain FP16:  " << plain_bytes << " bytes" << std::endl;
         std::cout << "  Packed FP16:  " << packed_bytes << " bytes" << std::endl;
-        std::cout << "  Difference:    " << (plain_bytes - packed_bytes) << " bytes" << std::endl;
+        if (plain_bytes >= packed_bytes) {
+            std::cout << "  Difference:    " << (plain_bytes - packed_bytes) << " bytes" << std::endl;
+        } else {
+            std::cout << "  Difference:   -" << (packed_bytes - plain_bytes) << " bytes" << std::endl;
+        }
     }
 
     // =========================================================================

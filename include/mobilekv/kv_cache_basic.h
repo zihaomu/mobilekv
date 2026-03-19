@@ -14,6 +14,8 @@
 
 namespace mobilekv {
 
+class KVTemplate;
+
 // ============================================================================
 // 基础类型定义
 // ============================================================================
@@ -47,6 +49,34 @@ enum class AccessMode {
 enum class MemoryDomain {
     HostRAM,
     DiskMapped
+};
+
+enum class QuantScheme {
+    None,
+    PerTensorAffine,
+    PerChannelSymmetric,
+    PerGroupAffine
+};
+
+inline size_t scalar_type_size(ScalarType t) {
+    switch (t) {
+        case ScalarType::FP32: return 4;
+        case ScalarType::FP16: return 2;
+        case ScalarType::BF16: return 2;
+        case ScalarType::INT8: return 1;
+        case ScalarType::UINT8: return 1;
+        case ScalarType::INT16: return 2;
+        default: return 1;
+    }
+}
+
+struct FormatDescriptor {
+    QuantScheme quant_scheme = QuantScheme::None;
+    uint32_t group_size = 0;
+    ScalarType storage_type = ScalarType::FP16;
+    ScalarType scale_type = ScalarType::FP16;
+    bool has_zero_point = false;
+    ScalarType zero_point_type = ScalarType::INT8;
 };
 
 // 基础类型别名
@@ -137,6 +167,7 @@ struct TemplateConfig {
     bool append_by_seq = true;   // 是否按 seq 追加
     bool supports_random_write = false;
     bool supports_random_read = true;
+    FormatDescriptor format;
 };
 
 struct AllocationInfo {
@@ -177,7 +208,7 @@ struct AccessView {
     uint32_t seq_begin = 0;
     uint32_t seq_len = 0;
 
-    const void* templ = nullptr;
+    const KVTemplate* templ = nullptr;
 
     AccessView() = default;
 
@@ -298,6 +329,7 @@ public:
         cfg_.alignment = 64;
         cfg_.supports_random_read = true;
         cfg_.supports_random_write = true;
+        cfg_.format.storage_type = ST;
 
         shape_.num_heads = num_heads;
         shape_.head_dim = head_dim;
@@ -341,15 +373,7 @@ public:
     }
 
     size_t element_size() const override {
-        switch (ST) {
-            case ScalarType::FP32: return 4;
-            case ScalarType::FP16: return 2;
-            case ScalarType::BF16: return 2;
-            case ScalarType::INT8: return 1;
-            case ScalarType::UINT8: return 1;
-            case ScalarType::INT16: return 2;
-            default: return 1;
-        }
+        return scalar_type_size(ST);
     }
 
     AllocationInfo allocation_info() const override {
@@ -379,6 +403,7 @@ public:
         cfg_.scalar_type = ST;
         cfg_.storage_mode = StorageMode::Contiguous;
         cfg_.alignment = 64;
+        cfg_.format.storage_type = ST;
 
         shape_.num_heads = num_heads;
         shape_.head_dim = head_dim;
@@ -425,20 +450,15 @@ public:
     }
 
     bool can_export_contiguous_span(uint32_t seq_begin, uint32_t seq_len) const override {
+        if (seq_len == 0) {
+            return true;
+        }
         // 只有在同一block内才连续
         return (seq_begin / pack_size_) == ((seq_begin + seq_len - 1) / pack_size_);
     }
 
     size_t element_size() const override {
-        switch (ST) {
-            case ScalarType::FP32: return 4;
-            case ScalarType::FP16: return 2;
-            case ScalarType::BF16: return 2;
-            case ScalarType::INT8: return 1;
-            case ScalarType::UINT8: return 1;
-            case ScalarType::INT16: return 2;
-            default: return 1;
-        }
+        return scalar_type_size(ST);
     }
 
     AllocationInfo allocation_info() const override {
@@ -517,6 +537,8 @@ public:
 struct KVCacheStorageConfig {
     size_t default_alignment = 64;
     bool thread_safe = false;
+    // 端侧默认ring窗口。为0时不启用默认ring。
+    uint32_t default_max_seq_capacity = 0;
 };
 
 class KVCacheStorage {
@@ -552,7 +574,7 @@ public:
 
     KVCacheStorageBuilder& add_template(std::shared_ptr<KVTemplate> templ);
 
-    // 简单版本：无max_seq限制
+    // 简单版本：max_seq_capacity 继承 config.default_max_seq_capacity
     KVCacheStorageBuilder& add_layer(
         LayerId layer,
         TemplateId k_template,

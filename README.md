@@ -13,6 +13,17 @@ while your inference engine keeps control of scheduling and kernel execution.
 
 这样用户能自定义很多内容，但你的框架本身仍然可控，不会退化成“裸指针池”。
 
+当前实现要点（2026-03）：
+
+- 支持按 layer 配置不同模板，且 K/V 可独立精度（`FP32/FP16/BF16/INT8/UINT8/INT16`）
+- 支持 `KVCacheStorageConfig::default_max_seq_capacity` 作为端侧默认ring窗口（4参数 `add_layer` 自动继承）
+- ring buffer 模式下，`locate` 使用窗口逻辑索引（`[0, seq_length)`）映射到物理槽位
+- 严格校验：当 `initial_seq_capacity > max_seq_capacity` 时构建失败（不做静默截断）
+- `KVAccessor<T>` 会做运行时类型检查，避免错误标量类型直接读写
+- `TemplateConfig` 包含 `FormatDescriptor`（仅存储格式元数据，不做量化计算）
+
+更多格式描述见：[docs/format-descriptor.md](docs/format-descriptor.md)
+
 设计目标
 
 这版 API 重点满足这些约束：

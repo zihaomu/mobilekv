@@ -2,6 +2,8 @@ add_subdirectory(googletest EXCLUDE_FROM_ALL)
 
 add_executable(kv_cache_test
   kv_cache_test.cpp
+  kv_cache_ring_buffer_test.cpp
+  kv_cache_format_test.cpp
 )
 
 set_target_properties(kv_cache_test PROPERTIES

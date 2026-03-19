@@ -138,7 +138,7 @@ int main() {
         }
 
         // 验证
-        int16_t expected = 500;
+        int16_t expected = 50;
         size_t offset = 50;
         if (k_ptr[offset] == expected) {
             std::cout << "Layer 2 (INT16 K): Write/Read verification PASSED" << std::endl;
@@ -203,8 +203,8 @@ int main() {
         else int8_bytes += layer_v_bytes;
     }
 
-    // 计算如果全部用FP32需要多少内存
-    size_t all_fp32_bytes = NUM_LAYERS * 2 * test_seq_len * NUM_HEADS * HEAD_DIM * 4;  // 4 bytes per float
+    // 计算如果全部用FP32需要多少内存（按当前分配容量）
+    size_t all_fp32_bytes = NUM_LAYERS * 2 * MAX_SEQ_LEN * NUM_HEADS * HEAD_DIM * 4;  // 4 bytes per float
 
     std::cout << "Memory breakdown:" << std::endl;
     std::cout << "  FP32:  " << fp32_bytes << " bytes ("

@@ -38,18 +38,18 @@ int main() {
         auto& k_plane = layer0.plane(PlaneKind::K);
 
         // 使用便捷访问器
-        KVAccessor<float> k_accessor(k_plane);
+        KVAccessor<uint16_t> k_accessor(k_plane);
         k_plane.resize_seq(10);
 
         // 写入数据
-        std::vector<float> k_data(32 * 128, 1.5f);
+        std::vector<uint16_t> k_data(32 * 128, 0x3555);  // raw FP16 bits
         k_accessor.write_token(5, k_data.data());
 
         // 读取验证
-        std::vector<float> read_data(32 * 128, 0.0f);
+        std::vector<uint16_t> read_data(32 * 128, 0);
         k_accessor.read_token(5, read_data.data());
 
-        if (read_data[0] == 1.5f) {
+        if (read_data[0] == 0x3555) {
             std::cout << "Write/Read verification PASSED" << std::endl;
         }
     }
@@ -167,24 +167,24 @@ int main() {
         v_plane.resize_seq(10);
 
         // 使用访问器
-        KVAccessor<float> k_acc(k_plane);
-        KVAccessor<float> v_acc(v_plane);
+        KVAccessor<uint16_t> k_acc(k_plane);
+        KVAccessor<uint16_t> v_acc(v_plane);
 
         // 写入head 2的数据
-        std::vector<float> head2_k(32, 100.0f);
-        std::vector<float> head2_v(32, 200.0f);
+        std::vector<uint16_t> head2_k(32, 100);
+        std::vector<uint16_t> head2_v(32, 200);
 
         k_acc.write_token_head(5, 2, head2_k.data());
         v_acc.write_token_head(5, 2, head2_v.data());
 
         // 读取验证
-        std::vector<float> verify_k(32, 0.0f);
-        std::vector<float> verify_v(32, 0.0f);
+        std::vector<uint16_t> verify_k(32, 0);
+        std::vector<uint16_t> verify_v(32, 0);
 
         k_acc.read_token_head(5, 2, verify_k.data());
         v_acc.read_token_head(5, 2, verify_v.data());
 
-        if (verify_k[0] == 100.0f && verify_v[0] == 200.0f) {
+        if (verify_k[0] == 100 && verify_v[0] == 200) {
             std::cout << "Per-head access verification PASSED" << std::endl;
         }
     }

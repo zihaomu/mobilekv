@@ -8,8 +8,64 @@
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
+#include <type_traits>
 
 namespace mobilekv {
+
+namespace detail {
+
+inline const char* scalar_type_name(ScalarType t) {
+    switch (t) {
+        case ScalarType::FP32: return "FP32";
+        case ScalarType::FP16: return "FP16";
+        case ScalarType::BF16: return "BF16";
+        case ScalarType::INT8: return "INT8";
+        case ScalarType::UINT8: return "UINT8";
+        case ScalarType::INT16: return "INT16";
+        case ScalarType::CUSTOM: return "CUSTOM";
+        default: return "UNKNOWN";
+    }
+}
+
+inline std::shared_ptr<KVTemplate> make_plain_template_for_type(
+    ScalarType type, uint32_t num_heads, uint32_t head_dim,
+    TemplateId id, const std::string& name) {
+    switch (type) {
+        case ScalarType::FP32:
+            return std::make_shared<PlainKVTemplate<ScalarType::FP32>>(num_heads, head_dim, id, name);
+        case ScalarType::FP16:
+            return std::make_shared<PlainKVTemplate<ScalarType::FP16>>(num_heads, head_dim, id, name);
+        case ScalarType::BF16:
+            return std::make_shared<PlainKVTemplate<ScalarType::BF16>>(num_heads, head_dim, id, name);
+        case ScalarType::INT8:
+            return std::make_shared<PlainKVTemplate<ScalarType::INT8>>(num_heads, head_dim, id, name);
+        case ScalarType::UINT8:
+            return std::make_shared<PlainKVTemplate<ScalarType::UINT8>>(num_heads, head_dim, id, name);
+        case ScalarType::INT16:
+            return std::make_shared<PlainKVTemplate<ScalarType::INT16>>(num_heads, head_dim, id, name);
+        default:
+            throw std::invalid_argument("Unsupported scalar type");
+    }
+}
+
+template<typename T>
+inline bool is_accessor_type_compatible(ScalarType type) {
+    if constexpr (std::is_same<T, float>::value) {
+        return type == ScalarType::FP32;
+    } else if constexpr (std::is_same<T, uint16_t>::value) {
+        return type == ScalarType::FP16 || type == ScalarType::BF16;
+    } else if constexpr (std::is_same<T, int8_t>::value) {
+        return type == ScalarType::INT8;
+    } else if constexpr (std::is_same<T, uint8_t>::value) {
+        return type == ScalarType::UINT8;
+    } else if constexpr (std::is_same<T, int16_t>::value) {
+        return type == ScalarType::INT16;
+    } else {
+        return false;
+    }
+}
+
+}  // namespace detail
 
 // ============================================================================
 // 高级API - 简化用户使用
@@ -87,6 +143,10 @@ inline std::unique_ptr<KVCacheStorage> create_simple_storage(
         case ScalarType::INT8:
             templ = std::make_shared<PlainKVTemplate<ScalarType::INT8>>(
                 num_heads, head_dim, templ_id, "simple_int8");
+            break;
+        case ScalarType::UINT8:
+            templ = std::make_shared<PlainKVTemplate<ScalarType::UINT8>>(
+                num_heads, head_dim, templ_id, "simple_uint8");
             break;
         case ScalarType::INT16:
             templ = std::make_shared<PlainKVTemplate<ScalarType::INT16>>(
@@ -172,6 +232,11 @@ inline std::unique_ptr<KVCacheStorage> create_simple_storage(
                 templ = std::make_shared<PlainKVTemplate<ScalarType::INT8>>(
                     num_heads, head_dim, next_id, name);
                 break;
+            case ScalarType::UINT8:
+                name = "simple_uint8";
+                templ = std::make_shared<PlainKVTemplate<ScalarType::UINT8>>(
+                    num_heads, head_dim, next_id, name);
+                break;
             case ScalarType::INT16:
                 name = "simple_int16";
                 templ = std::make_shared<PlainKVTemplate<ScalarType::INT16>>(
@@ -237,156 +302,28 @@ inline std::unique_ptr<KVCacheStorage> create_complex_storage(
     KVCacheStorageBuilder builder;
     builder.config({64, false});
 
-    // 模板映射: (k_type, v_type) -> template_id
-    struct TypePair {
-        ScalarType k, v;
-        bool operator==(const TypePair& other) const {
-            return k == other.k && v == other.v;
-        }
-    };
-
-    struct TypePairHash {
-        size_t operator()(const TypePair& tp) const {
-            return static_cast<size_t>(tp.k) * 100 + static_cast<size_t>(tp.v);
-        }
-    };
-
-    std::unordered_map<TypePair, TemplateId, TypePairHash> type_pair_to_id;
+    // 模板缓存：每种精度只创建一次，K/V共享模板池。
+    std::unordered_map<ScalarType, TemplateId> type_to_id;
     TemplateId next_id = 1;
 
-    auto create_template = [&](ScalarType k_type, ScalarType v_type) -> std::shared_ptr<KVTemplate> {
-        if (k_type == v_type) {
-            // 相同精度，使用普通模板
-            switch (k_type) {
-                case ScalarType::FP32:
-                    return std::make_shared<PlainKVTemplate<ScalarType::FP32>>(
-                        num_heads, head_dim, 0, "complex_fp32");
-                case ScalarType::FP16:
-                    return std::make_shared<PlainKVTemplate<ScalarType::FP16>>(
-                        num_heads, head_dim, 0, "complex_fp16");
-                case ScalarType::BF16:
-                    return std::make_shared<PlainKVTemplate<ScalarType::BF16>>(
-                        num_heads, head_dim, 0, "complex_bf16");
-                case ScalarType::INT8:
-                    return std::make_shared<PlainKVTemplate<ScalarType::INT8>>(
-                        num_heads, head_dim, 0, "complex_int8");
-                case ScalarType::INT16:
-                    return std::make_shared<PlainKVTemplate<ScalarType::INT16>>(
-                        num_heads, head_dim, 0, "complex_int16");
-                default:
-                    throw std::invalid_argument("Unsupported scalar type");
-            }
-        } else {
-            // 不同精度：创建两个模板
-            // 对于这种情况，我们需要分别创建K和V的模板
-            // 这里简化处理：创建混合模板（实际需要根据具体需求调整）
-            switch (k_type) {
-                case ScalarType::INT16:
-                    // K用INT16的情况
-                    return std::make_shared<PlainKVTemplate<ScalarType::INT16>>(
-                        num_heads, head_dim, 0, "complex_int16_k");
-                case ScalarType::INT8:
-                    return std::make_shared<PlainKVTemplate<ScalarType::INT8>>(
-                        num_heads, head_dim, 0, "complex_int8_k");
-                default:
-                    return std::make_shared<PlainKVTemplate<ScalarType::FP32>>(
-                        num_heads, head_dim, 0, "complex_fp32");
-            }
+    auto get_or_create_template_id = [&](ScalarType type, const char* prefix) -> TemplateId {
+        auto it = type_to_id.find(type);
+        if (it != type_to_id.end()) {
+            return it->second;
         }
-    };
-
-    auto get_or_create_template = [&](ScalarType k_type, ScalarType v_type) -> std::pair<TemplateId, TemplateId> {
-        TypePair tp{k_type, v_type};
-
-        // K和V分别的template id
-        TemplateId k_id, v_id;
-
-        // 查找或创建K模板
-        {
-            ScalarType k_only = k_type;
-            bool found = false;
-            for (const auto& pair : type_pair_to_id) {
-                if (pair.first.k == k_only) {
-                    k_id = pair.second;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                k_id = next_id++;
-                std::shared_ptr<KVTemplate> templ;
-                switch (k_type) {
-                    case ScalarType::FP32:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::FP32>>(
-                            num_heads, head_dim, k_id, "k_fp32");
-                        break;
-                    case ScalarType::FP16:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(
-                            num_heads, head_dim, k_id, "k_fp16");
-                        break;
-                    case ScalarType::INT8:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::INT8>>(
-                            num_heads, head_dim, k_id, "k_int8");
-                        break;
-                    case ScalarType::INT16:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::INT16>>(
-                            num_heads, head_dim, k_id, "k_int16");
-                        break;
-                    default:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::FP32>>(
-                            num_heads, head_dim, k_id, "k_fp32");
-                }
-                builder.add_template(templ);
-            }
-        }
-
-        // 查找或创建V模板
-        {
-            ScalarType v_only = v_type;
-            bool found = false;
-            for (const auto& pair : type_pair_to_id) {
-                if (pair.first.v == v_only) {
-                    v_id = pair.second;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                v_id = next_id++;
-                std::shared_ptr<KVTemplate> templ;
-                switch (v_type) {
-                    case ScalarType::FP32:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::FP32>>(
-                            num_heads, head_dim, v_id, "v_fp32");
-                        break;
-                    case ScalarType::FP16:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(
-                            num_heads, head_dim, v_id, "v_fp16");
-                        break;
-                    case ScalarType::INT8:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::INT8>>(
-                            num_heads, head_dim, v_id, "v_int8");
-                        break;
-                    case ScalarType::INT16:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::INT16>>(
-                            num_heads, head_dim, v_id, "v_int16");
-                        break;
-                    default:
-                        templ = std::make_shared<PlainKVTemplate<ScalarType::FP32>>(
-                            num_heads, head_dim, v_id, "v_fp32");
-                }
-                builder.add_template(templ);
-            }
-        }
-
-        return {k_id, v_id};
+        TemplateId id = next_id++;
+        std::string name = std::string(prefix) + "_" + detail::scalar_type_name(type);
+        builder.add_template(detail::make_plain_template_for_type(type, num_heads, head_dim, id, name));
+        type_to_id[type] = id;
+        return id;
     };
 
     // 创建层，启用ring buffer模式
     uint32_t initial_capacity = std::min(uint32_t(1024), max_seq_len);
     for (const auto& config : layers_config) {
-        auto ids = get_or_create_template(config.k_type, config.v_type);
-        builder.add_layer(config.layer_id, ids.first, ids.second, initial_capacity, max_seq_len);
+        TemplateId k_id = get_or_create_template_id(config.k_type, "k");
+        TemplateId v_id = get_or_create_template_id(config.v_type, "v");
+        builder.add_layer(config.layer_id, k_id, v_id, initial_capacity, max_seq_len);
     }
 
     return builder.build();
@@ -439,6 +376,12 @@ template<typename T>
 class KVAccessor {
 public:
     KVAccessor(KVPlane& plane) : plane_(plane) {
+        ScalarType plane_type = plane_.templ().config().scalar_type;
+        if (!detail::is_accessor_type_compatible<T>(plane_type)) {
+            throw std::invalid_argument(
+                std::string("KVAccessor type mismatch with plane scalar type: ") +
+                detail::scalar_type_name(plane_type));
+        }
         data_ = static_cast<T*>(plane.data());
     }
 
