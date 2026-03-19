@@ -1,786 +1,448 @@
 #include "mobilekv/kv_cache.h"
-
-#include <stdlib.h>
-#include <string.h>
-
-#define KV_ALIGN 64
-
-static size_t kv_align_up(size_t v) {
-  return (v + KV_ALIGN - 1) & ~(KV_ALIGN - 1);
-}
-
-static size_t kv_dtype_elem_bytes(KVDataType dtype) {
-  switch (dtype) {
-    case KV_DTYPE_FP16:
-      return sizeof(uint16_t);
-    case KV_DTYPE_INT8:
-      return sizeof(int8_t);
-    default:
-      return 0;
-  }
-}
-
-static int kv_valid_config(const KVConfig* c) {
-  const size_t elem_bytes = c ? kv_dtype_elem_bytes(c->dtype) : 0;
-
-  if (!c) return 0;
-  if (c->shape.layers <= 0) return 0;
-  if (c->shape.heads <= 0) return 0;
-  if (c->shape.head_dim <= 0) return 0;
-  if (c->shape.hidden != c->shape.heads * c->shape.head_dim) return 0;
-  if (c->shape.max_seq <= 0) return 0;
-  if (c->policy.max_prefix_tokens < 0) return 0;
-  if (c->policy.recent_keep < 0) return 0;
-  if (c->policy.max_prefix_tokens > c->shape.max_seq) return 0;
-  if (c->policy.max_prefix_tokens + c->policy.recent_keep > c->shape.max_seq) return 0;
-  if (elem_bytes == 0) return 0;
-  if (c->backend != KV_BACKEND_CPU) return 0;
-  return 1;
-}
-
-static size_t kv_tensor_bytes(const KVShape* s, size_t elem_bytes) {
-  return (size_t)s->layers * (size_t)s->max_seq * (size_t)s->hidden * elem_bytes;
-}
-
-static uint8_t* kv_token_ptr_mut(KVCache* kv, void* base, int layer, int token, size_t elem) {
-  size_t off = ((size_t)layer * (size_t)kv->config.shape.max_seq + (size_t)token) *
-               (size_t)kv->config.shape.hidden * elem;
-  return (uint8_t*)base + off;
-}
-
-static const uint8_t* kv_token_ptr_const(const KVCache* kv, const void* base, int layer, int token, size_t elem) {
-  size_t off = ((size_t)layer * (size_t)kv->config.shape.max_seq + (size_t)token) *
-               (size_t)kv->config.shape.hidden * elem;
-  return (const uint8_t*)base + off;
-}
-
-static int kv_prefix_capacity(const KVCache* kv) {
-  if (!kv->state.prefix_frozen) {
-    return kv->config.policy.max_prefix_tokens;
-  }
-  if (kv->config.policy.use_ring_buffer) {
-    /* Ring can collapse reserved prefix tail when actual prefix is smaller. */
-    return kv->state.prefix_tokens;
-  }
-  return kv->config.policy.max_prefix_tokens;
-}
-
-static int kv_recent_capacity(const KVCache* kv) {
-  if (!kv->state.prefix_frozen) {
-    return kv->config.policy.recent_keep;
-  }
-  if (kv->config.policy.use_ring_buffer) {
-    /* Ring expands recent to use all physical tail after sealed prefix. */
-    return kv->config.shape.max_seq - kv->state.prefix_tokens;
-  }
-  return kv->config.policy.recent_keep;
-}
-
-static int kv_prefix_tokens_runtime(const KVCache* kv) {
-  return kv->state.prefix_frozen ? kv->state.prefix_tokens : 0;
-}
-
-static size_t kv_elem_bytes(const KVCache* kv) {
-  return kv_dtype_elem_bytes(kv->config.dtype);
-}
-
-static size_t kv_token_bytes(const KVCache* kv) {
-  return (size_t)kv->config.shape.hidden * kv_elem_bytes(kv);
-}
-
-/* logical token index [0, valid_tokens) -> physical token slot [0, max_seq) */
-static int kv_logical_to_physical(const KVCache* kv, int logical_token) {
-  const int prefix = kv_prefix_tokens_runtime(kv);
-  const int recent_cap = kv_recent_capacity(kv);
-  const int recent_base = kv_prefix_capacity(kv);
-
-  if (logical_token < 0 || logical_token >= kv->state.valid_tokens) return -1;
-  if (!kv->state.prefix_frozen) return logical_token;
-
-  if (logical_token < prefix) {
-    return logical_token;
-  }
-
-  /* recent logical region */
-  const int recent_logical = logical_token - prefix;
-
-  if (!kv->config.policy.use_ring_buffer) {
-    int recent_start = kv->state.cursor - kv->state.recent_size;
-    if (recent_start < recent_base) recent_start = recent_base;
-    return recent_start + recent_logical;
-  } else {
-    if (recent_cap <= 0) return -1;
-    /* oldest recent starts at recent_head - recent_size */
-    int oldest = kv->state.recent_head - kv->state.recent_size;
-    while (oldest < 0) oldest += recent_cap;
-    return recent_base + ((oldest + recent_logical) % recent_cap);
-  }
-}
-
-size_t KVRequiredBytes(const KVConfig* config) {
-  const size_t elem_bytes = config ? kv_dtype_elem_bytes(config->dtype) : 0;
-  if (!kv_valid_config(config)) return 0;
-  const size_t t = kv_tensor_bytes(&config->shape, elem_bytes);
-  return KV_ALIGN + kv_align_up(t) + kv_align_up(t);
-}
-
-KVStatus KVInit(
-    KVCache* kv,
-    const KVConfig* config) {
-  const size_t bytes = KVRequiredBytes(config);
-  void* arena = 0;
-  KVStatus st;
-
-  if (!kv || !config) return KV_ERR_NULL;
-  if (bytes == 0) return KV_ERR_BAD_ARG;
-
-  arena = malloc(bytes);
-  if (!arena) return KV_ERR_NO_SPACE;
-
-  st = KVInitPreallocated(kv, config, arena, bytes);
-  if (st != KV_OK) {
-    free(arena);
-    return st;
-  }
-  kv->owns_arena = 1;
-  return KV_OK;
-}
-
-KVStatus KVInitPreallocated(
-    KVCache* kv,
-    const KVConfig* config,
-    void* arena_base,
-    size_t arena_bytes) {
-  uint8_t* p;
-  size_t t;
-
-  if (!kv || !config || !arena_base) return KV_ERR_NULL;
-  if (!kv_valid_config(config)) return KV_ERR_BAD_ARG;
-
-  memset(kv, 0, sizeof(*kv));
-  kv->config = *config;
-  kv->arena_base = arena_base;
-  kv->arena_bytes = arena_bytes;
-  kv->owns_arena = 0;
-
-  p = (uint8_t*)kv_align_up((size_t)arena_base);
-  t = kv_tensor_bytes(&config->shape, kv_dtype_elem_bytes(config->dtype));
-
-  kv->arena.k_data = p;
-  kv->arena.k_bytes = t;
-  p += kv_align_up(t);
-
-  kv->arena.v_data = p;
-  kv->arena.v_bytes = t;
-  p += kv_align_up(t);
-
-  if ((size_t)(p - (uint8_t*)arena_base) > arena_bytes) {
-    memset(kv, 0, sizeof(*kv));
-    return KV_ERR_NO_SPACE;
-  }
-
-  kv->initialized = true;
-  KVReset(kv);
-  return KV_OK;
-}
-
-void KVReset(KVCache* kv) {
-  if (!kv) return;
-  kv->state.cursor = 0;
-  kv->state.valid_tokens = 0;
-  kv->state.base_token = 0;
-  kv->state.prefix_frozen = false;
-  kv->state.prefix_tokens = 0;
-  kv->state.recent_head = 0;
-  kv->state.recent_size = 0;
-}
-
-KVStatus KVRelease(KVCache* kv) {
-  if (!kv) return KV_ERR_NULL;
-  if (kv->owns_arena && kv->arena_base) {
-    free(kv->arena_base);
-  }
-  memset(kv, 0, sizeof(*kv));
-  return KV_OK;
-}
-
-KVStatus KVSealPrefix(
-    KVCache* kv,
-    int prefix_tokens) {
-  int current_recent;
-  int recent_capacity;
-  int prefix_base_capacity;
-  int keep_recent;
-  int drop_recent;
-  int src_recent;
-  int dst_recent;
-  int l;
-  size_t bytes;
-  uint8_t* k;
-  uint8_t* v;
-
-  if (!kv) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (kv->state.prefix_frozen) return KV_ERR_BAD_STATE;
-  if (prefix_tokens < 0) return KV_ERR_BAD_ARG;
-  if (prefix_tokens > kv->state.valid_tokens) return KV_ERR_BAD_ARG;
-  prefix_base_capacity = kv->config.policy.max_prefix_tokens;
-  if (prefix_tokens > prefix_base_capacity) return KV_ERR_BAD_ARG;
-
-  if (kv->config.policy.use_ring_buffer) {
-    recent_capacity = kv->config.shape.max_seq - prefix_tokens;
-  } else {
-    recent_capacity = kv->config.policy.recent_keep;
-  }
-  kv->state.prefix_tokens = prefix_tokens;
-  kv->state.prefix_frozen = true;
-
-  current_recent = kv->state.valid_tokens - prefix_tokens;
-  if (current_recent < 0) current_recent = 0;
-  keep_recent = current_recent;
-  if (keep_recent > recent_capacity) keep_recent = recent_capacity;
-  drop_recent = current_recent - keep_recent;
-
-  src_recent = prefix_tokens + (current_recent - keep_recent);
-  dst_recent = kv_prefix_capacity(kv);
-  bytes = kv_token_bytes(kv);
-
-  for (l = 0; l < kv->config.shape.layers; ++l) {
-    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, kv_elem_bytes(kv));
-    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, kv_elem_bytes(kv));
-
-    if (keep_recent > 0 && src_recent != dst_recent) {
-      memmove(k + (size_t)dst_recent * bytes,
-              k + (size_t)src_recent * bytes,
-              (size_t)keep_recent * bytes);
-      memmove(v + (size_t)dst_recent * bytes,
-              v + (size_t)src_recent * bytes,
-              (size_t)keep_recent * bytes);
-    }
-  }
-
-  kv->state.base_token += drop_recent;
-  kv->state.recent_size = keep_recent;
-  kv->state.valid_tokens = prefix_tokens + keep_recent;
-  kv->state.cursor = kv_prefix_capacity(kv) + keep_recent;
-
-  if (kv->config.policy.use_ring_buffer) {
-    kv->state.recent_head = recent_capacity > 0 ? (keep_recent % recent_capacity) : 0;
-  } else {
-    kv->state.recent_head = 0;
-  }
-
-  return KV_OK;
-}
-
-/* Compact path for non-ring mode: [prefix] + [last recent_capacity] */
-KVStatus KVCompact(KVCache* kv) {
-  const int prefix = kv_prefix_tokens_runtime(kv);
-  const int valid = kv->state.valid_tokens;
-  const int cursor = kv->state.cursor;
-  const int recent = valid - prefix;
-  const int recent_cap = kv_recent_capacity(kv);
-  int keep_recent;
-  int src_recent;
-  int dst_recent;
-  int l;
-  size_t bytes;
-  uint8_t* k;
-  uint8_t* v;
-
-  if (!kv) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (!kv->state.prefix_frozen) return KV_ERR_BAD_STATE;
-
-  if (kv->config.policy.use_ring_buffer) {
-    /* Ring mode does not require memmove compaction for recent zone. */
-    return KV_OK;
-  }
-
-  keep_recent = recent;
-  if (keep_recent > recent_cap) {
-    keep_recent = recent_cap;
-  }
-  if (keep_recent < 0) keep_recent = 0;
-
-  src_recent = cursor - keep_recent;
-  dst_recent = kv_prefix_capacity(kv);
-  bytes = kv_token_bytes(kv);
-
-  for (l = 0; l < kv->config.shape.layers; ++l) {
-    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, kv_elem_bytes(kv));
-    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, kv_elem_bytes(kv));
-
-    if (keep_recent > 0 && src_recent != dst_recent) {
-      memmove(k + (size_t)dst_recent * bytes,
-              k + (size_t)src_recent * bytes,
-              (size_t)keep_recent * bytes);
-      memmove(v + (size_t)dst_recent * bytes,
-              v + (size_t)src_recent * bytes,
-              (size_t)keep_recent * bytes);
-    }
-  }
-
-  kv->state.base_token += (recent - keep_recent);
-  kv->state.recent_size = keep_recent;
-  kv->state.valid_tokens = prefix + keep_recent;
-  kv->state.cursor = kv_prefix_capacity(kv) + keep_recent;
-  return KV_OK;
-}
-
-static KVStatus kv_non_ring_make_room_for_append(KVCache* kv) {
-  const int prefix = kv_prefix_tokens_runtime(kv);
-  const int recent_base = kv_prefix_capacity(kv);
-  const int recent_cap = kv_recent_capacity(kv);
-  const int max_seq = kv->config.shape.max_seq;
-  int keep_recent;
-  int l;
-  size_t bytes;
-  uint8_t* k;
-  uint8_t* v;
-
-  if (!kv->state.prefix_frozen) {
-    if (kv->state.cursor < max_seq) return KV_OK;
-    return KV_ERR_NO_SPACE;
-  }
-  if (recent_cap <= 0) return KV_ERR_NO_SPACE;
-  if (kv->state.cursor < max_seq) return KV_OK;
-
-  {
-    KVStatus st = KVCompact(kv);
-    if (st != KV_OK) return st;
-  }
-  if (kv->state.cursor < max_seq) return KV_OK;
-
-  if (kv->state.recent_size <= 0) return KV_ERR_NO_SPACE;
-
-  keep_recent = kv->state.recent_size - 1;
-  bytes = kv_token_bytes(kv);
-
-  for (l = 0; l < kv->config.shape.layers; ++l) {
-    k = kv_token_ptr_mut(kv, kv->arena.k_data, l, 0, kv_elem_bytes(kv));
-    v = kv_token_ptr_mut(kv, kv->arena.v_data, l, 0, kv_elem_bytes(kv));
-    if (keep_recent > 0) {
-      memmove(k + (size_t)recent_base * bytes,
-              k + (size_t)(recent_base + 1) * bytes,
-              (size_t)keep_recent * bytes);
-      memmove(v + (size_t)recent_base * bytes,
-              v + (size_t)(recent_base + 1) * bytes,
-              (size_t)keep_recent * bytes);
-    }
-  }
-
-  kv->state.base_token += 1;
-  kv->state.recent_size = keep_recent;
-  kv->state.valid_tokens = prefix + keep_recent;
-  kv->state.cursor = recent_base + keep_recent;
-  return KV_OK;
-}
-
-static KVStatus kv_append_contiguous(
-    KVCache* kv,
-    const void* new_k_layers,
-    const void* new_v_layers,
-    size_t layer_stride_bytes) {
-  const int layers = kv->config.shape.layers;
-  const int prefix = kv_prefix_tokens_runtime(kv);
-  const int recent_cap = kv_recent_capacity(kv);
-  const size_t bytes = kv_token_bytes(kv);
-  int l;
-  int phys_slot;
-
-  if (!kv->config.policy.use_ring_buffer) {
-    KVStatus st;
-    if (kv->state.prefix_frozen && recent_cap <= 0) return KV_ERR_NO_SPACE;
-    st = kv_non_ring_make_room_for_append(kv);
-    if (st != KV_OK) return st;
-    phys_slot = kv->state.cursor;
-  } else {
-    /* Before prefix is sealed, we append contiguously into prefix area / early arena. */
-    if (!kv->state.prefix_frozen) {
-      if (kv->state.cursor >= kv->config.shape.max_seq) return KV_ERR_NO_SPACE;
-      phys_slot = kv->state.cursor;
-    } else {
-      if (recent_cap <= 0) return KV_ERR_NO_SPACE;
-      phys_slot = kv_prefix_capacity(kv) + kv->state.recent_head;
-    }
-  }
-
-  for (l = 0; l < layers; ++l) {
-    uint8_t* dst_k = kv_token_ptr_mut(kv, kv->arena.k_data, l, phys_slot, kv_elem_bytes(kv));
-    uint8_t* dst_v = kv_token_ptr_mut(kv, kv->arena.v_data, l, phys_slot, kv_elem_bytes(kv));
-    const uint8_t* src_k = (const uint8_t*)new_k_layers + (size_t)l * layer_stride_bytes;
-    const uint8_t* src_v = (const uint8_t*)new_v_layers + (size_t)l * layer_stride_bytes;
-    memcpy(dst_k, src_k, bytes);
-    memcpy(dst_v, src_v, bytes);
-  }
-
-  if (!kv->config.policy.use_ring_buffer) {
-    kv->state.cursor += 1;
-    if (!kv->state.prefix_frozen) {
-      if (kv->state.valid_tokens < kv->config.shape.max_seq) kv->state.valid_tokens += 1;
-    } else {
-      if (kv->state.recent_size < recent_cap) {
-        kv->state.recent_size += 1;
-        kv->state.valid_tokens = prefix + kv->state.recent_size;
-      } else {
-        kv->state.base_token += 1;
-      }
-      return KV_OK;
-    }
-    kv->state.recent_size = kv->state.valid_tokens - prefix;
-  } else {
-    if (!kv->state.prefix_frozen) {
-      kv->state.cursor += 1;
-      kv->state.valid_tokens += 1;
-    } else {
-      if (kv->state.recent_size < recent_cap) {
-        kv->state.recent_size += 1;
-        kv->state.valid_tokens = prefix + kv->state.recent_size;
-        kv->state.cursor = kv->state.valid_tokens;
-      } else {
-        /* Overwrite oldest recent token. */
-        kv->state.base_token += 1;
-      }
-      kv->state.recent_head += 1;
-      if (kv->state.recent_head >= recent_cap) kv->state.recent_head = 0;
-    }
-  }
-
-  return KV_OK;
-}
-
-KVStatus KVAppend(
-    KVCache* kv,
-    const void* new_k_layers,
-    const void* new_v_layers) {
-  const size_t elem_bytes = kv ? kv_elem_bytes(kv) : 0;
-  if (!kv || !new_k_layers || !new_v_layers) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (elem_bytes == 0) return KV_ERR_UNSUPPORTED;
-
-  return kv_append_contiguous(
-      kv,
-      new_k_layers,
-      new_v_layers,
-      (size_t)kv->config.shape.hidden * elem_bytes);
-}
-
-KVStatus KVAppendViewWrite(
-    KVCache* kv,
-    const KVAppendView* view) {
-  if (!kv || !view) return KV_ERR_NULL;
-  if (!view->k || !view->v) return KV_ERR_NULL;
-  if (view->layer_stride_bytes < kv_token_bytes(kv)) return KV_ERR_BAD_ARG;
-
-  return kv_append_contiguous(
-      kv,
-      view->k,
-      view->v,
-      view->layer_stride_bytes);
-}
-
-KVStatus KVReserveTokenSlot(KVCache* kv, int* out_token) {
-  int phys_slot;
-  if (!kv || !out_token) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (kv_elem_bytes(kv) == 0) return KV_ERR_UNSUPPORTED;
-
-  if (!kv->config.policy.use_ring_buffer) {
-    KVStatus st;
-    if (kv->state.prefix_frozen && kv_recent_capacity(kv) <= 0) return KV_ERR_NO_SPACE;
-    st = kv_non_ring_make_room_for_append(kv);
-    if (st != KV_OK) return st;
-    phys_slot = kv->state.cursor;
-  } else {
-    if (!kv->state.prefix_frozen) {
-      if (kv->state.cursor >= kv->config.shape.max_seq) return KV_ERR_NO_SPACE;
-      phys_slot = kv->state.cursor;
-    } else {
-      if (kv_recent_capacity(kv) <= 0) return KV_ERR_NO_SPACE;
-      phys_slot = kv_prefix_capacity(kv) + kv->state.recent_head;
-    }
-  }
-  *out_token = phys_slot;
-  return KV_OK;
-}
-
-KVStatus KVCommitToken(KVCache* kv, int token) {
-  const int prefix = kv_prefix_tokens_runtime(kv);
-  const int recent_cap = kv_recent_capacity(kv);
-
-  if (!kv) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-
-  if (!kv->config.policy.use_ring_buffer) {
-    if (kv->state.prefix_frozen && recent_cap <= 0) return KV_ERR_NO_SPACE;
-    if (token != kv->state.cursor) return KV_ERR_BAD_ARG;
-    kv->state.cursor += 1;
-    if (!kv->state.prefix_frozen) {
-      if (kv->state.valid_tokens < kv->config.shape.max_seq) kv->state.valid_tokens += 1;
-    } else {
-      if (kv->state.recent_size < recent_cap) {
-        kv->state.recent_size += 1;
-        kv->state.valid_tokens = prefix + kv->state.recent_size;
-      } else {
-        kv->state.base_token += 1;
-      }
-      return KV_OK;
-    }
-    kv->state.recent_size = kv->state.valid_tokens - prefix;
-    return KV_OK;
-  }
-
-  if (!kv->state.prefix_frozen) {
-    if (token != kv->state.cursor) return KV_ERR_BAD_ARG;
-    kv->state.cursor += 1;
-    kv->state.valid_tokens += 1;
-    return KV_OK;
-  }
-
-  if (token != kv_prefix_capacity(kv) + kv->state.recent_head) return KV_ERR_BAD_ARG;
-
-  if (kv->state.recent_size < recent_cap) {
-    kv->state.recent_size += 1;
-    kv->state.valid_tokens = prefix + kv->state.recent_size;
-    kv->state.cursor = kv->state.valid_tokens;
-  } else {
-    kv->state.base_token += 1;
-  }
-
-  kv->state.recent_head += 1;
-  if (kv->state.recent_head >= recent_cap) kv->state.recent_head = 0;
-
-  return KV_OK;
-}
-
-static KVStatus kv_attention_write_layer_raw(
-    KVCache* kv,
-    int layer,
-    int token,
-    const void* k_data,
-    const void* v_data) {
-  const size_t bytes = kv_token_bytes(kv);
-  const size_t elem_bytes = kv_elem_bytes(kv);
-  uint8_t* dst_k;
-  uint8_t* dst_v;
-
-  if (!kv || !k_data || !v_data) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (elem_bytes == 0) return KV_ERR_UNSUPPORTED;
-  if (layer < 0 || layer >= kv->config.shape.layers) return KV_ERR_BAD_ARG;
-  if (token < 0 || token >= kv->config.shape.max_seq) return KV_ERR_BAD_ARG;
-
-  dst_k = kv_token_ptr_mut(kv, kv->arena.k_data, layer, token, elem_bytes);
-  dst_v = kv_token_ptr_mut(kv, kv->arena.v_data, layer, token, elem_bytes);
-  memcpy(dst_k, k_data, bytes);
-  memcpy(dst_v, v_data, bytes);
-  return KV_OK;
-}
-
-static KVStatus kv_attention_read_layer_raw(
-    const KVCache* kv,
-    int layer,
-    int logical_token,
-    const void** out_k,
-    const void** out_v) {
-  const size_t elem_bytes = kv ? kv_elem_bytes(kv) : 0;
-  int phys;
-  const void* k;
-  const void* v;
-
-  if (!kv || !out_k || !out_v) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (elem_bytes == 0) return KV_ERR_UNSUPPORTED;
-  if (layer < 0 || layer >= kv->config.shape.layers) return KV_ERR_BAD_ARG;
-  if (logical_token < 0 || logical_token >= kv->state.valid_tokens) return KV_ERR_BAD_ARG;
-
-  phys = kv_logical_to_physical(kv, logical_token);
-  if (phys < 0) return KV_ERR_BAD_ARG;
-  k = (const void*)kv_token_ptr_const(kv, kv->arena.k_data, layer, phys, elem_bytes);
-  v = (const void*)kv_token_ptr_const(kv, kv->arena.v_data, layer, phys, elem_bytes);
-
-  *out_k = k;
-  *out_v = v;
-  return KV_OK;
-}
-
-KVStatus KVAttentionWriteLayer(
-    KVCache* kv,
-    int layer,
-    int token,
-    const KVAttentionLayerArg* arg) {
-  if (!kv || !arg) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (arg->dtype != kv->config.dtype) return KV_ERR_BAD_ARG;
-
-  switch (arg->dtype) {
-    case KV_DTYPE_FP16:
-      return kv_attention_write_layer_raw(
-          kv,
-          layer,
-          token,
-          arg->k_data,
-          arg->v_data);
-    case KV_DTYPE_INT8:
-      return kv_attention_write_layer_raw(
-          kv,
-          layer,
-          token,
-          arg->k_data,
-          arg->v_data);
-    default:
-      return KV_ERR_BAD_ARG;
-  }
-}
-
-KVStatus KVAttentionReadLayer(
-    const KVCache* kv,
-    int layer,
-    int logical_token,
-    KVAttentionLayerArg* arg) {
-  const void* k;
-  const void* v;
-  KVStatus st;
-
-  if (!kv || !arg) return KV_ERR_NULL;
-  if (!kv->initialized) return KV_ERR_BAD_STATE;
-  if (arg->dtype != kv->config.dtype) return KV_ERR_BAD_ARG;
-
-  switch (arg->dtype) {
-    case KV_DTYPE_FP16:
-      k = 0;
-      v = 0;
-      st = kv_attention_read_layer_raw(kv, layer, logical_token, &k, &v);
-      if (st != KV_OK) return st;
-      arg->k_data = k;
-      arg->v_data = v;
-      return KV_OK;
-    case KV_DTYPE_INT8:
-      k = 0;
-      v = 0;
-      st = kv_attention_read_layer_raw(kv, layer, logical_token, &k, &v);
-      if (st != KV_OK) return st;
-      arg->k_data = k;
-      arg->v_data = v;
-      return KV_OK;
-    default:
-      return KV_ERR_BAD_ARG;
-  }
-}
-
-int KVValidTokens(const KVCache* kv) {
-  return kv ? kv->state.valid_tokens : 0;
-}
-
-KVStatus KVGetSnapshot(const KVCache* kv, KVSnapshot* snapshot) {
-  if (!kv || !snapshot) return KV_ERR_NULL;
-
-  snapshot->valid_tokens = kv->state.valid_tokens;
-  snapshot->cursor = kv->state.cursor;
-  snapshot->base_token = kv->state.base_token;
-  snapshot->prefix_tokens = kv_prefix_tokens_runtime(kv);
-  snapshot->recent_tokens = kv->state.recent_size;
-  snapshot->dtype = kv->config.dtype;
-  snapshot->initialized = kv->initialized;
-  return KV_OK;
-}
-
-int KVCursor(const KVCache* kv) {
-  return kv ? kv->state.cursor : 0;
-}
-
-int KVBaseToken(const KVCache* kv) {
-  return kv ? kv->state.base_token : 0;
-}
-
-int KVPrefixTokens(const KVCache* kv) {
-  return kv ? kv_prefix_tokens_runtime(kv) : 0;
-}
-
-int KVRecentTokens(const KVCache* kv) {
-  return kv ? kv->state.recent_size : 0;
-}
-
-KVDataType KVDType(const KVCache* kv) {
-  return kv ? kv->config.dtype : KV_DTYPE_FP16;
-}
-
-bool KVIsInitialized(const KVCache* kv) {
-  return kv ? kv->initialized : false;
-}
-
-int KVRecentFirstPhysicalSlot(const KVCache* kv) {
-    if (!kv || !kv->initialized) return 0;
-
-    const int recent_capacity = kv_recent_capacity(kv);
-    if (recent_capacity <= 0) return 0;
-
-    if (!kv->config.policy.use_ring_buffer) {
-        if (!kv->state.prefix_frozen || kv->state.recent_size <= 0) return 0;
-        return kv->state.cursor - kv->state.recent_size;
+#include <cstring>
+#include <memory>
+#include <algorithm>
+
+namespace mobilekv {
+
+// ============================================================================
+// KVPlane 实现
+// ============================================================================
+
+class KVPlaneImpl : public KVPlane {
+public:
+    KVPlaneImpl(LayerId layer_id, PlaneKind kind, std::shared_ptr<KVTemplate> templ,
+                uint32_t max_seq_capacity = 0)
+        : layer_id_(layer_id), kind_(kind), templ_(std::move(templ)) {
+        stats_.bytes_allocated = 0;
+        stats_.seq_capacity = 0;
+        stats_.seq_length = 0;
+        stats_.max_seq_capacity = max_seq_capacity;
+        stats_.is_ring_buffer = (max_seq_capacity > 0);
+        stats_.write_head = 0;
     }
 
-    if (kv->state.recent_size < recent_capacity) {
-        return 0;
-    }
-    return kv->state.recent_head;
-}
+    PlaneKind kind() const override { return kind_; }
+    LayerId layer_id() const override { return layer_id_; }
+    const KVTemplate& templ() const override { return *templ_; }
 
-int KVRecentLogicalStart(const KVCache* kv) {
-    if (!kv || !kv->initialized) return 0;
-    return kv->state.prefix_tokens + kv->state.base_token;
-}
+    const PlaneStats& stats() const override { return stats_; }
 
+    bool reserve_seq(uint32_t target_seq_capacity) override {
+        // Ring buffer模式下，预分配max_seq_capacity或target_seq_capacity
+        uint32_t actual_capacity = target_seq_capacity;
+        if (stats_.is_ring_buffer && stats_.max_seq_capacity > 0) {
+            actual_capacity = std::max(target_seq_capacity, stats_.max_seq_capacity);
+        }
 
-KVStatus KVGetAttentionView(
-    const KVCache* kv,
-    int q_pos,
-    KVAttentionView* view)
-{
-    if (!kv || !view) return KV_ERR_NULL;
-    if (!kv->initialized) return KV_ERR_BAD_STATE;
+        if (actual_capacity <= stats_.seq_capacity) {
+            return true;
+        }
 
-    const KVState* s = &kv->state;
-    const int recent_capacity = kv_recent_capacity(kv);
+        size_t new_bytes = templ_->bytes_for_capacity(actual_capacity);
 
-    int prefix = s->prefix_tokens;
-    int recent = s->recent_size;
+        // 对齐到模板要求的alignment
+        size_t alignment = templ_->config().alignment;
+        if (alignment > 0) {
+            new_bytes = (new_bytes + alignment - 1) & ~(alignment - 1);
+        }
 
-    int logical_recent_start = KVRecentLogicalStart(kv);
+        // 分配新内存
+        Byte* new_data = static_cast<Byte*>(aligned_alloc(alignment, new_bytes));
+        if (!new_data) {
+            return false;
+        }
 
-    view->q_pos = q_pos;
+        // 如果有旧数据，复制过来
+        if (data_ && stats_.bytes_allocated > 0) {
+            std::memcpy(new_data, data_.get(), stats_.bytes_allocated);
+        }
 
-    view->visible_tokens = prefix + recent;
-    view->prefix_tokens = prefix;
+        data_ = std::unique_ptr<Byte[]>(new_data);
+        stats_.bytes_allocated = new_bytes;
+        stats_.seq_capacity = actual_capacity;
 
-    view->recent_logical_start = logical_recent_start;
-    view->recent_size = recent;
-    view->recent_capacity = recent_capacity;
-
-    /* compute oldest slot */
-
-    int first_slot = KVRecentFirstPhysicalSlot(kv);
-
-    view->recent_first_slot = first_slot;
-
-    if (kv->config.policy.use_ring_buffer) {
-        view->recent_wrapped = (first_slot + recent > recent_capacity);
-    } else {
-        view->recent_wrapped = false;
+        return true;
     }
 
-    view->k_base = kv->arena.k_data;
-    view->v_base = kv->arena.v_data;
+    bool resize_seq(uint32_t target_seq_length) override {
+        // Ring buffer模式下，长度不能超过max_seq_capacity
+        if (stats_.is_ring_buffer && stats_.max_seq_capacity > 0) {
+            if (target_seq_length > stats_.max_seq_capacity) {
+                target_seq_length = stats_.max_seq_capacity;
+            }
+        }
 
-    view->layer_stride_bytes =
-        kv->config.shape.max_seq *
-        kv->config.shape.hidden *
-        kv_elem_bytes(kv);
+        if (target_seq_length > stats_.seq_capacity) {
+            if (!reserve_seq(target_seq_length)) {
+                return false;
+            }
+        }
+        stats_.seq_length = target_seq_length;
+        return true;
+    }
 
-    view->token_stride_bytes =
-        kv->config.shape.hidden *
-        kv_elem_bytes(kv);
+    bool append_seq(uint32_t token_count) override {
+        if (stats_.is_ring_buffer) {
+            // Ring buffer模式：覆盖最旧的token
+            return append_seq_ring_buffer(token_count);
+        } else {
+            // 普通模式：直接增长
+            uint32_t new_length = stats_.seq_length + token_count;
+            return resize_seq(new_length);
+        }
+    }
 
-    return KV_OK;
+    // Ring buffer模式的追加实现
+    bool append_seq_ring_buffer(uint32_t token_count) {
+        uint32_t max_len = stats_.max_seq_capacity;
+
+        if (token_count > max_len) {
+            // 追加的token比buffer还大，直接从新token开始
+            stats_.write_head = 0;
+            stats_.seq_length = max_len;
+            return reserve_seq(max_len);
+        }
+
+        uint32_t current_len = stats_.seq_length;
+
+        if (current_len < max_len) {
+            // 还没填满buffer，正常追加
+            uint32_t new_length = std::min(current_len + token_count, max_len);
+            if (new_length > stats_.seq_capacity) {
+                if (!reserve_seq(max_len)) {
+                    return false;
+                }
+            }
+            stats_.seq_length = new_length;
+            // 更新write_head
+            stats_.write_head = (stats_.write_head + token_count) % max_len;
+        } else {
+            // Buffer已满，覆盖最旧的token
+            // write_head指向最新数据的起始位置，覆盖时会写入该位置
+            // 逻辑起始位置 = (write_head) % max_len（数据是循环的）
+            stats_.write_head = (stats_.write_head + token_count) % max_len;
+            // seq_length保持为max_len
+        }
+
+        return true;
+    }
+
+    void clear() override {
+        stats_.seq_length = 0;
+        if (stats_.is_ring_buffer) {
+            stats_.write_head = 0;
+        }
+    }
+
+    void* data() override {
+        return data_.get();
+    }
+
+    const void* data() const override {
+        return data_.get();
+    }
+
+    PhysicalAddr locate(const LogicalCoord& coord) const override {
+        LogicalCoord adjusted_coord = coord;
+        adjusted_coord.layer = layer_id_;
+        return templ_->locate(adjusted_coord);
+    }
+
+    AccessView acquire_seq_view(
+        uint32_t seq_begin,
+        uint32_t seq_len,
+        AccessMode mode
+    ) override {
+        AccessView view;
+        view.seq_begin = seq_begin;
+        view.seq_len = seq_len;
+        view.templ = templ_.get();
+
+        if (seq_begin + seq_len > stats_.seq_length) {
+            return view;  // 返回空的view
+        }
+
+        // 检查是否可以连续访问
+        bool can_contiguous = templ_->can_export_contiguous_span(seq_begin, seq_len);
+
+        if (can_contiguous) {
+            view.contiguous = true;
+            size_t begin_offset = templ_->bytes_for_tokens(seq_begin);
+            size_t view_bytes = templ_->bytes_for_tokens(seq_len);
+            view.base = data_.get() + begin_offset;
+            view.bytes = view_bytes;
+        } else {
+            view.contiguous = false;
+            view.base = data_.get();
+            view.bytes = stats_.bytes_allocated;
+        }
+
+        return view;
+    }
+
+    void release_seq_view(AccessView& view) override {
+        // 当前实现不需要做什么，view是轻量引用
+        // 后续如果加入disk-backed storage，在这里处理释放
+        view = AccessView();
+    }
+
+private:
+    LayerId layer_id_;
+    PlaneKind kind_;
+    std::shared_ptr<KVTemplate> templ_;
+    std::unique_ptr<Byte[]> data_;
+    PlaneStats stats_;
+};
+
+// ============================================================================
+// LayerStorage 实现
+// ============================================================================
+
+class LayerStorageImpl : public LayerStorage {
+public:
+    LayerStorageImpl(LayerId layer_id,
+                    std::shared_ptr<KVTemplate> k_templ,
+                    std::shared_ptr<KVTemplate> v_templ,
+                    uint32_t initial_capacity,
+                    uint32_t max_seq_capacity = 0)
+        : layer_id_(layer_id)
+        , k_plane_(layer_id, PlaneKind::K, std::move(k_templ), max_seq_capacity)
+        , v_plane_(layer_id, PlaneKind::V, std::move(v_templ), max_seq_capacity) {
+        if (initial_capacity > 0) {
+            k_plane_.reserve_seq(initial_capacity);
+            v_plane_.reserve_seq(initial_capacity);
+        }
+    }
+
+    LayerId layer_id() const override { return layer_id_; }
+
+    KVPlane& plane(PlaneKind kind) override {
+        return kind == PlaneKind::K ? static_cast<KVPlane&>(k_plane_) :
+                                       static_cast<KVPlane&>(v_plane_);
+    }
+
+    const KVPlane& plane(PlaneKind kind) const override {
+        return kind == PlaneKind::K ? static_cast<const KVPlane&>(k_plane_) :
+                                       static_cast<const KVPlane&>(v_plane_);
+    }
+
+    bool reserve_seq(uint32_t target_seq_capacity) override {
+        bool ok = k_plane_.reserve_seq(target_seq_capacity);
+        if (!ok) return false;
+        ok = v_plane_.reserve_seq(target_seq_capacity);
+        return ok;
+    }
+
+    bool append_seq(uint32_t token_count) override {
+        bool ok = k_plane_.append_seq(token_count);
+        if (!ok) return false;
+        ok = v_plane_.append_seq(token_count);
+        return ok;
+    }
+
+    void clear() override {
+        k_plane_.clear();
+        v_plane_.clear();
+    }
+
+    size_t total_bytes() const override {
+        return k_plane_.stats().bytes_allocated +
+               v_plane_.stats().bytes_allocated;
+    }
+
+private:
+    LayerId layer_id_;
+    KVPlaneImpl k_plane_;
+    KVPlaneImpl v_plane_;
+};
+
+// ============================================================================
+// KVCacheStorage 实现
+// ============================================================================
+
+class KVCacheStorageImpl : public KVCacheStorage {
+public:
+    KVCacheStorageImpl(const KVCacheStorageConfig& config)
+        : config_(config) {}
+
+    bool register_template(std::shared_ptr<KVTemplate> templ) override {
+        if (!templ) return false;
+        TemplateId id = templ->config().id;
+        if (id == 0) {
+            // 自动分配ID
+            id = next_template_id_++;
+        }
+        templates_[id] = std::move(templ);
+        return true;
+    }
+
+    const KVTemplate* find_template(TemplateId id) const override {
+        auto it = templates_.find(id);
+        if (it == templates_.end()) {
+            return nullptr;
+        }
+        return it->second.get();
+    }
+
+    bool create_layer(const LayerSpec& spec) override {
+        // 检查模板是否存在
+        auto k_it = templates_.find(spec.k_spec.template_id);
+        auto v_it = templates_.find(spec.v_spec.template_id);
+
+        if (k_it == templates_.end() || v_it == templates_.end()) {
+            return false;
+        }
+
+        // 如果层已存在，返回false
+        if (layers_.find(spec.layer_id) != layers_.end()) {
+            return false;
+        }
+
+        // 获取max_seq_capacity（K和V使用相同的值）
+        uint32_t max_seq_capacity = std::max(spec.k_spec.max_seq_capacity, spec.v_spec.max_seq_capacity);
+
+        // 创建新的layer storage
+        auto layer = std::make_unique<LayerStorageImpl>(
+            spec.layer_id,
+            k_it->second,
+            v_it->second,
+            spec.k_spec.initial_seq_capacity,
+            max_seq_capacity
+        );
+
+        layers_[spec.layer_id] = std::move(layer);
+        return true;
+    }
+
+    bool has_layer(LayerId layer) const override {
+        return layers_.find(layer) != layers_.end();
+    }
+
+    LayerStorage& layer(LayerId layer) override {
+        return *layers_.at(layer);
+    }
+
+    const LayerStorage& layer(LayerId layer) const override {
+        return *layers_.at(layer);
+    }
+
+    bool reserve_all(uint32_t target_seq_capacity) override {
+        for (auto& pair : layers_) {
+            if (!pair.second->reserve_seq(target_seq_capacity)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool append_all(uint32_t token_count) override {
+        for (auto& pair : layers_) {
+            if (!pair.second->append_seq(token_count)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void clear_all() override {
+        for (auto& pair : layers_) {
+            pair.second->clear();
+        }
+    }
+
+    size_t total_bytes() const override {
+        size_t total = 0;
+        for (const auto& pair : layers_) {
+            total += pair.second->total_bytes();
+        }
+        return total;
+    }
+
+    // 便捷方法
+    void set_num_layers(size_t n) { num_layers_ = n; }
+    size_t num_layers() const { return num_layers_; }
+
+private:
+    KVCacheStorageConfig config_;
+    std::unordered_map<TemplateId, std::shared_ptr<KVTemplate>> templates_;
+    std::unordered_map<LayerId, std::unique_ptr<LayerStorage>> layers_;
+    TemplateId next_template_id_ = 1;
+    size_t num_layers_ = 0;
+};
+
+// 让KVTemplate支持shared_from_this
+// 由于KVTemplate是抽象基类，我们需要修改它的定义来支持shared_from_this
+// 但为了简化，我们在KVCacheStorageImpl中用const_cast，
+// 实际上更好的做法是让KVTemplate继承enable_shared_from_this
+
+// ============================================================================
+// KVCacheStorageBuilder 实现
+// ============================================================================
+
+KVCacheStorageBuilder& KVCacheStorageBuilder::config(const KVCacheStorageConfig& cfg) {
+    config_ = cfg;
+    return *this;
 }
+
+KVCacheStorageBuilder& KVCacheStorageBuilder::add_template(std::shared_ptr<KVTemplate> templ) {
+    templates_.push_back(std::move(templ));
+    return *this;
+}
+
+KVCacheStorageBuilder& KVCacheStorageBuilder::add_layer(
+    LayerId layer,
+    TemplateId k_template,
+    TemplateId v_template,
+    uint32_t initial_seq_capacity
+) {
+    return add_layer(layer, k_template, v_template, initial_seq_capacity, 0);
+}
+
+KVCacheStorageBuilder& KVCacheStorageBuilder::add_layer(
+    LayerId layer,
+    TemplateId k_template,
+    TemplateId v_template,
+    uint32_t initial_seq_capacity,
+    uint32_t max_seq_capacity
+) {
+    LayerSpec spec;
+    spec.layer_id = layer;
+    spec.k_spec.kind = PlaneKind::K;
+    spec.k_spec.template_id = k_template;
+    spec.k_spec.initial_seq_capacity = initial_seq_capacity;
+    spec.k_spec.max_seq_capacity = max_seq_capacity;
+    spec.v_spec.kind = PlaneKind::V;
+    spec.v_spec.template_id = v_template;
+    spec.v_spec.initial_seq_capacity = initial_seq_capacity;
+    spec.v_spec.max_seq_capacity = max_seq_capacity;
+    layers_.push_back(spec);
+    return *this;
+}
+
+std::unique_ptr<KVCacheStorage> KVCacheStorageBuilder::build() {
+    // 没有层的情况返回nullptr
+    if (layers_.empty()) {
+        return nullptr;
+    }
+
+    auto storage = std::make_unique<KVCacheStorageImpl>(config_);
+
+    // 先注册所有模板
+    for (auto& templ : templates_) {
+        storage->register_template(std::move(templ));
+    }
+
+    // 然后创建所有层
+    for (auto& layer_spec : layers_) {
+        if (!storage->create_layer(layer_spec)) {
+            return nullptr;
+        }
+    }
+
+    storage->set_num_layers(layers_.size());
+
+    return std::move(storage);
+}
+
+}  // namespace mobilekv

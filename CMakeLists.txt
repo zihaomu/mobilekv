@@ -22,19 +22,24 @@ target_compile_features(mobilekv PUBLIC cxx_std_17)
 
 if(MOBILEKV_BUILD_EXAMPLES)
   add_executable(mobilekv_demo
-    example/kv_cache_basic_example.cpp
+    example/fp32_prefill_decode_example.cpp
   )
   target_link_libraries(mobilekv_demo PRIVATE mobilekv::mobilekv)
 
-  add_executable(mobilekv_llama_adapter_demo
-    example/llama.cpp_adapter.cpp
+  add_executable(mobilekv_mixed_precision_demo
+    example/mixed_precision_example.cpp
   )
-  target_link_libraries(mobilekv_llama_adapter_demo PRIVATE mobilekv::mobilekv)
+  target_link_libraries(mobilekv_mixed_precision_demo PRIVATE mobilekv::mobilekv)
 
-  add_executable(mobilekv_attention_layer_submit_demo
-    example/attention_layer_submit_example.cpp
+  add_executable(mobilekv_packed_layout_demo
+    example/packed_layout_example.cpp
   )
-  target_link_libraries(mobilekv_attention_layer_submit_demo PRIVATE mobilekv::mobilekv)
+  target_link_libraries(mobilekv_packed_layout_demo PRIVATE mobilekv::mobilekv)
+
+  add_executable(mobilekv_convenience_demo
+    example/convenience_api_example.cpp
+  )
+  target_link_libraries(mobilekv_convenience_demo PRIVATE mobilekv::mobilekv)
 endif()
 
 if(MOBILEKV_BUILD_BENCHMARKS)
