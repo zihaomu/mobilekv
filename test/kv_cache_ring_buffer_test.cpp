@@ -93,9 +93,9 @@ TEST(KVCacheRingBufferTest, LocateRejectsOutOfRangeCoordinates) {
     EXPECT_TRUE(k_plane.locate(LogicalCoord(0, 2, 1, 3)).valid);
 }
 
-TEST(KVCacheRingBufferTest, PackedViewOffsetUsesLocateBegin) {
+TEST(KVCacheRingBufferTest, DimBlockViewOffsetUsesLocateBegin) {
     KVCacheStorageBuilder builder;
-    auto templ = std::make_shared<PackedKVTemplate<ScalarType::INT8>>(2, 4, 4, 1, "packed_int8");
+    auto templ = std::make_shared<DimBlockKVTemplate>(2, 1, 4, 1, "dimblock_pack4");
     builder.add_template(templ);
     builder.add_layer(0, 1, 1, 16);
 

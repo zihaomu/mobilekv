@@ -60,22 +60,22 @@ TEST_F(KVCacheBasicTest, PlainINT8Template) {
     EXPECT_EQ(templ->bytes_for_tokens(50), 50u * 2u * 32u * 1u);
 }
 
-TEST_F(KVCacheBasicTest, PackedKVTemplate) {
-    auto templ = std::make_shared<PackedKVTemplate<ScalarType::FP32>>(8, 128, 8, 10, "packed_fp32");
+TEST_F(KVCacheBasicTest, DimBlockKVTemplate) {
+    auto templ = std::make_shared<DimBlockKVTemplate>(8, 32, 16, 10, "dimblock_u128");
 
-    EXPECT_EQ(templ->config().name, "packed_fp32");
+    EXPECT_EQ(templ->config().name, "dimblock_u128");
     EXPECT_EQ(templ->shape().num_heads, 8u);
-    EXPECT_EQ(templ->shape().head_dim, 128u);
-    EXPECT_EQ(templ->element_size(), 4u);
+    EXPECT_EQ(templ->shape().head_dim, 32u);
+    EXPECT_EQ(templ->element_size(), 16u);
 
-    // 测试packed模式下的定位
-    LogicalCoord coord(0, 10, 2, 32);  // seq=10 在第二个block
+    // 测试dim block模式下的定位
+    LogicalCoord coord(0, 10, 2, 16);
     PhysicalAddr addr = templ->locate(coord);
     EXPECT_TRUE(addr.valid);
 
-    // 测试连续性
-    EXPECT_FALSE(templ->can_export_contiguous_span(0, 16));  // 跨越两个block
-    EXPECT_TRUE(templ->can_export_contiguous_span(0, 4));   // 同一个block内
+    // dim block布局按seq连续导出
+    EXPECT_TRUE(templ->can_export_contiguous_span(0, 16));
+    EXPECT_TRUE(templ->can_export_contiguous_span(7, 4));
 }
 
 // ============================================================================
@@ -324,14 +324,14 @@ TEST_F(KVCacheBasicTest, MixedPrecision) {
 }
 
 // ============================================================================
-// Packed Layout 测试
+// Dim Block Layout 测试
 // ============================================================================
 
-TEST_F(KVCacheBasicTest, PackedLayoutReadWrite) {
+TEST_F(KVCacheBasicTest, DimBlockLayoutReadWrite) {
     KVCacheStorageBuilder builder;
 
-    // pack_size = 4
-    auto templ = std::make_shared<PackedKVTemplate<ScalarType::INT8>>(4, 16, 4, 1, "packed_int8");
+    // 每个dim block是4 bytes, dim_blocks=4 => 等价原始D=16 pack4
+    auto templ = std::make_shared<DimBlockKVTemplate>(4, 4, 4, 1, "dimblock_pack4");
     builder.add_template(templ);
     builder.add_layer(0, 1, 1, 16);
 
@@ -343,8 +343,8 @@ TEST_F(KVCacheBasicTest, PackedLayoutReadWrite) {
 
     k_plane.resize_seq(8);
 
-    // 写入数据 - 在packed layout中我们需要使用locate来定位
-    auto addr = k_plane.locate(LogicalCoord(0, 5, 1, 2));  // seq=5 在block 1
+    // 写入数据 - 在dim block layout中使用locate定位
+    auto addr = k_plane.locate(LogicalCoord(0, 5, 1, 2));
     ASSERT_TRUE(addr.valid);
 
     uint8_t* data = static_cast<uint8_t*>(k_plane.data());

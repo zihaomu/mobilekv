@@ -48,15 +48,14 @@ TEST(KVCacheFormatTest, AccessorRejectsScalarTypeMismatch) {
 
 TEST(KVCacheFormatTest, FormatDescriptorDefaultMatchesTemplateScalarType) {
     auto plain = std::make_shared<PlainKVTemplate<ScalarType::INT8>>(2, 8, 1, "plain");
-    auto packed = std::make_shared<PackedKVTemplate<ScalarType::BF16>>(2, 8, 4, 2, "packed");
+    auto dimblock = std::make_shared<DimBlockKVTemplate>(2, 2, 8, 2, "dimblock");
 
     EXPECT_EQ(plain->config().format.quant_scheme, QuantScheme::None);
     EXPECT_EQ(plain->config().format.storage_type, ScalarType::INT8);
 
-    EXPECT_EQ(packed->config().format.quant_scheme, QuantScheme::None);
-    EXPECT_EQ(packed->config().format.storage_type, ScalarType::BF16);
+    EXPECT_EQ(dimblock->config().format.quant_scheme, QuantScheme::None);
+    EXPECT_EQ(dimblock->config().format.storage_type, ScalarType::CUSTOM);
 }
 
 }  // namespace test
 }  // namespace mobilekv
-

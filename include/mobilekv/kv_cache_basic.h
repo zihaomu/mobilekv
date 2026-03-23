@@ -389,25 +389,30 @@ private:
 };
 
 // ============================================================================
-// Packed Template 实现 - [head][seq_block][dim][seq_inner] 布局
+// Dim Block Template 实现 - [seq][head][dim_block] 布局
+// 语义：dim 表示已经pack后的block索引，单个元素大小为block_bytes。
 // ============================================================================
 
-template<ScalarType ST>
-class PackedKVTemplate : public KVTemplate {
+class DimBlockKVTemplate : public KVTemplate {
 public:
-    PackedKVTemplate(uint32_t num_heads, uint32_t head_dim, uint32_t pack_size,
-                     TemplateId id = 0, const std::string& name = "packed")
-        : pack_size_(pack_size) {
+    DimBlockKVTemplate(uint32_t num_heads, uint32_t dim_blocks, uint32_t block_bytes,
+                       TemplateId id = 0, const std::string& name = "dimblock")
+        : block_bytes_(block_bytes) {
+        if (block_bytes_ == 0) {
+            throw std::invalid_argument("DimBlockKVTemplate block_bytes must be > 0");
+        }
         cfg_.id = id;
         cfg_.name = name;
-        cfg_.scalar_type = ST;
+        cfg_.scalar_type = ScalarType::CUSTOM;
         cfg_.storage_mode = StorageMode::Contiguous;
         cfg_.alignment = 64;
-        cfg_.format.storage_type = ST;
+        cfg_.supports_random_read = true;
+        cfg_.supports_random_write = true;
+        cfg_.format.storage_type = ScalarType::CUSTOM;
 
         shape_.num_heads = num_heads;
-        shape_.head_dim = head_dim;
-        shape_.inner_bytes = pack_size_ * element_size();
+        shape_.head_dim = dim_blocks;
+        shape_.inner_bytes = block_bytes_;
     }
 
     const TemplateConfig& config() const override { return cfg_; }
@@ -415,50 +420,39 @@ public:
 
     PhysicalAddr locate(const LogicalCoord& coord) const override {
         PhysicalAddr p;
-        size_t elem_size = element_size();
-
-        uint32_t seq_block = coord.seq / pack_size_;
-        uint32_t seq_inner = coord.seq % pack_size_;
-
-        size_t dim_stride = pack_size_ * elem_size;
+        size_t elem_size = block_bytes_;
+        size_t dim_stride = elem_size;
         size_t head_stride = static_cast<size_t>(shape_.head_dim) * dim_stride;
-        size_t block_stride = static_cast<size_t>(shape_.num_heads) * head_stride;
+        size_t token_stride = static_cast<size_t>(shape_.num_heads) * head_stride;
 
-        p.byte_offset = seq_block * block_stride +
+        p.byte_offset = coord.seq * token_stride +
                         coord.head * head_stride +
-                        coord.dim * dim_stride +
-                        seq_inner * elem_size;
+                        coord.dim * dim_stride;
         p.byte_size = elem_size;
-        p.loop0 = seq_block;
+        p.loop0 = coord.seq;
         p.loop1 = coord.head;
-        p.inner_offset = (coord.dim * pack_size_ + seq_inner) * elem_size;
+        p.inner_offset = coord.dim * elem_size;
         p.valid = true;
         return p;
     }
 
     size_t bytes_for_tokens(uint32_t token_count) const override {
-        uint32_t blocks = (token_count + pack_size_ - 1) / pack_size_;
-        return static_cast<size_t>(blocks) *
+        return static_cast<size_t>(token_count) *
                static_cast<size_t>(shape_.num_heads) *
                static_cast<size_t>(shape_.head_dim) *
-               pack_size_ *
-               element_size();
+               block_bytes_;
     }
 
     size_t bytes_for_capacity(uint32_t seq_capacity) const override {
         return bytes_for_tokens(seq_capacity);
     }
 
-    bool can_export_contiguous_span(uint32_t seq_begin, uint32_t seq_len) const override {
-        if (seq_len == 0) {
-            return true;
-        }
-        // 只有在同一block内才连续
-        return (seq_begin / pack_size_) == ((seq_begin + seq_len - 1) / pack_size_);
+    bool can_export_contiguous_span(uint32_t, uint32_t) const override {
+        return true;
     }
 
     size_t element_size() const override {
-        return scalar_type_size(ST);
+        return block_bytes_;
     }
 
     AllocationInfo allocation_info() const override {
@@ -471,7 +465,7 @@ public:
 private:
     TemplateConfig cfg_;
     TemplateShape shape_;
-    uint32_t pack_size_;
+    uint32_t block_bytes_;
 };
 
 // ============================================================================
@@ -612,14 +606,8 @@ using PlainINT8V = PlainKVTemplate<ScalarType::INT8>;
 using PlainINT16K = PlainKVTemplate<ScalarType::INT16>;
 using PlainINT16V = PlainKVTemplate<ScalarType::INT16>;
 
-using PackedFP32K = PackedKVTemplate<ScalarType::FP32>;
-using PackedFP32V = PackedKVTemplate<ScalarType::FP32>;
-using PackedFP16K = PackedKVTemplate<ScalarType::FP16>;
-using PackedFP16V = PackedKVTemplate<ScalarType::FP16>;
-using PackedINT8K = PackedKVTemplate<ScalarType::INT8>;
-using PackedINT8V = PackedKVTemplate<ScalarType::INT8>;
-using PackedINT16K = PackedKVTemplate<ScalarType::INT16>;
-using PackedINT16V = PackedKVTemplate<ScalarType::INT16>;
+using DimBlockK = DimBlockKVTemplate;
+using DimBlockV = DimBlockKVTemplate;
 
 }  // namespace mobilekv
 

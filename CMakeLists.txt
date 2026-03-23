@@ -31,10 +31,10 @@ if(MOBILEKV_BUILD_EXAMPLES)
   )
   target_link_libraries(mobilekv_mixed_precision_demo PRIVATE mobilekv::mobilekv)
 
-  add_executable(mobilekv_packed_layout_demo
-    example/packed_layout_example.cpp
+  add_executable(mobilekv_dim_block_demo
+    example/dim_block_example.cpp
   )
-  target_link_libraries(mobilekv_packed_layout_demo PRIVATE mobilekv::mobilekv)
+  target_link_libraries(mobilekv_dim_block_demo PRIVATE mobilekv::mobilekv)
 
   add_executable(mobilekv_convenience_demo
     example/convenience_api_example.cpp

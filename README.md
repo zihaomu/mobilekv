@@ -11,7 +11,7 @@ MobileKV currently provides:
 - Multi-layer KV storage (`LayerStorage`) with per-layer K/V template binding
 - Mixed precision per plane (`K` and `V` can use different scalar types)
 - Ring-buffer mode for sliding-window retention
-- Plain and packed storage templates
+- Plain and dim-block storage templates
 - Raw-typed convenience accessors with runtime scalar-type checks
 - Format metadata descriptor (`FormatDescriptor`) attached to templates
 
@@ -241,7 +241,7 @@ Run examples:
 ```bash
 ./build_mobilekv/mobilekv_demo
 ./build_mobilekv/mobilekv_mixed_precision_demo
-./build_mobilekv/mobilekv_packed_layout_demo
+./build_mobilekv/mobilekv_dim_block_demo
 ./build_mobilekv/mobilekv_convenience_demo
 ```
 
@@ -260,7 +260,7 @@ Benchmark includes both:
 
 - `example/fp32_prefill_decode_example.cpp`
 - `example/mixed_precision_example.cpp`
-- `example/packed_layout_example.cpp`
+- `example/dim_block_example.cpp`
 - `example/convenience_api_example.cpp`
 
 ## Test Coverage (Current Focus)
@@ -269,7 +269,7 @@ Unit tests currently validate:
 
 - Template addressing and byte sizing
 - Mixed precision K/V assignment
-- Packed layout locate/view correctness
+- Dim-block layout locate/view correctness
 - Ring-buffer logical-to-physical mapping and wrap behavior
 - Default ring configuration inheritance and explicit override
 - Strict build failure for invalid `initial > max`
