@@ -1,5 +1,0 @@
-if(EXISTS "/home/moo/work/my_lab/mobilekv/build_mobilekv/test/kv_cache_test[1]_tests.cmake")
-  include("/home/moo/work/my_lab/mobilekv/build_mobilekv/test/kv_cache_test[1]_tests.cmake")
-else()
-  add_test(kv_cache_test_NOT_BUILT kv_cache_test_NOT_BUILT)
-endif()

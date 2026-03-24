@@ -36,10 +36,20 @@ int main() {
     KVCacheStorageBuilder builder;
     builder.config({64, false, MAX_SEQ_LEN});
 
-    auto k_dimblock = std::make_shared<DimBlockKVTemplate>(
-        NUM_HEADS, DIM_BLOCKS, BLOCK_BYTES, 1, "k_dimblock_pack4");
-    auto v_dimblock = std::make_shared<DimBlockKVTemplate>(
-        NUM_HEADS, DIM_BLOCKS, BLOCK_BYTES, 2, "v_dimblock_pack4");
+    OpaqueScalarId pack4 = builder.register_opaque_scalar({"int8_pack4", BLOCK_BYTES, BLOCK_BYTES});
+    if (pack4 == 0) {
+        std::cerr << "register_opaque_scalar failed" << std::endl;
+        return 1;
+    }
+
+    auto k_dimblock = builder.make_dim_block_template(
+        NUM_HEADS, DIM_BLOCKS, pack4, 1, "k_dimblock_pack4");
+    auto v_dimblock = builder.make_dim_block_template(
+        NUM_HEADS, DIM_BLOCKS, pack4, 2, "v_dimblock_pack4");
+    if (!k_dimblock || !v_dimblock) {
+        std::cerr << "make_dim_block_template failed" << std::endl;
+        return 1;
+    }
 
     builder.add_template(k_dimblock);
     builder.add_template(v_dimblock);

@@ -78,6 +78,39 @@ TEST_F(KVCacheBasicTest, DimBlockKVTemplate) {
     EXPECT_TRUE(templ->can_export_contiguous_span(7, 4));
 }
 
+TEST_F(KVCacheBasicTest, OpaqueScalarRegistryAndFactory) {
+    KVCacheStorageBuilder builder;
+
+    OpaqueScalarId scalar_id = builder.register_opaque_scalar({"int8_pack4", 4, 4});
+    ASSERT_NE(scalar_id, 0u);
+
+    const OpaqueScalarDesc* desc = builder.find_opaque_scalar(scalar_id);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_EQ(desc->name, "int8_pack4");
+    EXPECT_EQ(desc->bytes, 4u);
+    EXPECT_EQ(desc->alignment, 4u);
+
+    auto templ = builder.make_dim_block_template(8, 32, scalar_id, 11, "k_pack4");
+    ASSERT_NE(templ, nullptr);
+    EXPECT_EQ(templ->config().id, 11u);
+    EXPECT_EQ(templ->config().name, "k_pack4");
+    EXPECT_EQ(templ->config().scalar_type, ScalarType::CUSTOM);
+    EXPECT_EQ(templ->config().alignment, 4u);
+    EXPECT_EQ(templ->config().block_bytes, 4u);
+    EXPECT_EQ(templ->element_size(), 4u);
+}
+
+TEST_F(KVCacheBasicTest, OpaqueScalarRegistryRejectsInvalidDescAndUnknownId) {
+    KVCacheStorageBuilder builder;
+
+    EXPECT_EQ(builder.register_opaque_scalar({"bad_zero_bytes", 0, 4}), 0u);
+    EXPECT_EQ(builder.register_opaque_scalar({"bad_zero_align", 4, 0}), 0u);
+    EXPECT_EQ(builder.find_opaque_scalar(999), nullptr);
+
+    auto templ = builder.make_dim_block_template(4, 8, 999, 1, "invalid");
+    EXPECT_EQ(templ, nullptr);
+}
+
 // ============================================================================
 // KVCacheStorage Builder 测试
 // ============================================================================

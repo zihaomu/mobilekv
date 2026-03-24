@@ -85,7 +85,14 @@ using TemplateId = uint32_t;
 using TokenIndex = uint32_t;
 using HeadIndex = uint32_t;
 using BlockIndex = uint32_t;
+using OpaqueScalarId = uint32_t;
 using Byte = uint8_t;
+
+struct OpaqueScalarDesc {
+    std::string name;
+    uint32_t bytes = 0;
+    uint32_t alignment = 1;
+};
 
 // ============================================================================
 // 逻辑坐标与物理地址
@@ -396,16 +403,21 @@ private:
 class DimBlockKVTemplate : public KVTemplate {
 public:
     DimBlockKVTemplate(uint32_t num_heads, uint32_t dim_blocks, uint32_t block_bytes,
-                       TemplateId id = 0, const std::string& name = "dimblock")
+                       TemplateId id = 0, const std::string& name = "dimblock",
+                       size_t alignment = 64)
         : block_bytes_(block_bytes) {
         if (block_bytes_ == 0) {
             throw std::invalid_argument("DimBlockKVTemplate block_bytes must be > 0");
+        }
+        if (alignment == 0) {
+            throw std::invalid_argument("DimBlockKVTemplate alignment must be > 0");
         }
         cfg_.id = id;
         cfg_.name = name;
         cfg_.scalar_type = ScalarType::CUSTOM;
         cfg_.storage_mode = StorageMode::Contiguous;
-        cfg_.alignment = 64;
+        cfg_.alignment = alignment;
+        cfg_.block_bytes = block_bytes_;
         cfg_.supports_random_read = true;
         cfg_.supports_random_write = true;
         cfg_.format.storage_type = ScalarType::CUSTOM;
@@ -566,6 +578,16 @@ class KVCacheStorageBuilder {
 public:
     KVCacheStorageBuilder& config(const KVCacheStorageConfig& cfg);
 
+    OpaqueScalarId register_opaque_scalar(const OpaqueScalarDesc& desc);
+    const OpaqueScalarDesc* find_opaque_scalar(OpaqueScalarId id) const;
+    std::shared_ptr<KVTemplate> make_dim_block_template(
+        uint32_t num_heads,
+        uint32_t dim_blocks,
+        OpaqueScalarId scalar_id,
+        TemplateId id = 0,
+        const std::string& name = "dimblock"
+    ) const;
+
     KVCacheStorageBuilder& add_template(std::shared_ptr<KVTemplate> templ);
 
     // 简单版本：max_seq_capacity 继承 config.default_max_seq_capacity
@@ -591,6 +613,8 @@ private:
     KVCacheStorageConfig config_;
     std::vector<std::shared_ptr<KVTemplate>> templates_;
     std::vector<LayerSpec> layers_;
+    std::unordered_map<OpaqueScalarId, OpaqueScalarDesc> opaque_scalars_;
+    OpaqueScalarId next_opaque_scalar_id_ = 1;
 };
 
 // ============================================================================

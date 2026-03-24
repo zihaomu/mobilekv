@@ -41,7 +41,7 @@
 *.dwo
 
 # CMake build artifacts
-/build.*
+/build
 build_mobilekv
 CMakeCache.txt
 CMakeFiles/

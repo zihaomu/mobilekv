@@ -12,6 +12,7 @@ MobileKV currently provides:
 - Mixed precision per plane (`K` and `V` can use different scalar types)
 - Ring-buffer mode for sliding-window retention
 - Plain and dim-block storage templates
+- Opaque-scalar registry for dim-block template construction
 - Raw-typed convenience accessors with runtime scalar-type checks
 - Format metadata descriptor (`FormatDescriptor`) attached to templates
 
@@ -220,6 +221,42 @@ See:
 - [docs/format-descriptor.md](docs/format-descriptor.md)
 
 This is metadata only; MobileKV does not perform quant/dequant compute.
+
+## Opaque Scalar Registry (Dim-Block)
+
+For pre-packed D-last storage (for example `pack4` in `[H, S, D/4]` block space), use builder-level opaque scalar registration.
+This is the recommended end-to-end path:
+
+```cpp
+KVCacheStorageBuilder builder;
+builder.config({64, false, 2048});
+
+OpaqueScalarId pack4 = builder.register_opaque_scalar({"int8_pack4", 4, 4});
+if (pack4 == 0) {
+    return;  // invalid descriptor
+}
+
+auto k_t = builder.make_dim_block_template(32, 128 / 4, pack4, 1, "k_pack4");
+auto v_t = builder.make_dim_block_template(32, 128 / 4, pack4, 2, "v_pack4");
+if (!k_t || !v_t) {
+    return;  // unknown scalar id
+}
+
+builder.add_template(k_t);
+builder.add_template(v_t);
+builder.add_layer(0, 1, 2, 1024, 2048);
+
+auto storage = builder.build();
+if (!storage) {
+    return;  // invalid layer/template wiring
+}
+```
+
+Notes:
+
+- `register_opaque_scalar(...)` returns `0` on invalid descriptor (`bytes==0` or `alignment==0`).
+- `make_dim_block_template(...)` returns `nullptr` for unknown scalar IDs.
+- `dim_blocks` is already block-space (`D/4`), not raw `D`.
 
 ## Build and Run
 

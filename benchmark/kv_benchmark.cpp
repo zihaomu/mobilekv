@@ -7,6 +7,7 @@
 // 3. Random access performance
 // 4. Memory allocation performance
 // 5. Multi-layer operations
+// 6. Decode-step critical path (append + write + window view)
 // ============================================================================
 
 #include "mobilekv/kv_cache.h"
@@ -419,6 +420,74 @@ void benchmark_mixed_precision_growth(BenchmarkResult& result) {
     result.ns_per_op = (result.time_ms * 1000000.0) / result.operations;
 }
 
+void benchmark_decode_step_ring(BenchmarkResult& result) {
+    KVCacheStorageBuilder builder;
+    builder.config({64, false, BENCH_MAX_SEQ});
+    auto templ = std::make_shared<PlainKVTemplate<ScalarType::FP16>>(
+        BENCH_NUM_HEADS, BENCH_HEAD_DIM, 1, "decode_fp16");
+    builder.add_template(templ);
+
+    for (uint32_t layer = 0; layer < BENCH_NUM_LAYERS; ++layer) {
+        builder.add_layer(layer, 1, 1, BENCH_MAX_SEQ);
+    }
+
+    auto storage = builder.build();
+
+    // Simulate a realistic decode entry point with a non-empty prompt cache.
+    const uint32_t prefill_len = 1024;
+    storage->append_all(prefill_len);
+
+    const uint32_t num_steps = 2000;
+    const uint32_t window_size = 512;
+    const size_t token_bytes = templ->bytes_for_tokens(1);
+    std::vector<Byte> token_k(token_bytes, static_cast<Byte>(0x11));
+    std::vector<Byte> token_v(token_bytes, static_cast<Byte>(0x22));
+
+    volatile size_t observed_view_bytes = 0;
+
+    BenchmarkTimer timer;
+    timer.start();
+
+    for (uint32_t step = 0; step < num_steps; ++step) {
+        // 1) Append one token for all layers in ring mode.
+        storage->append_all(1);
+
+        // 2) Write newly generated K/V for the newest token on each layer.
+        for (uint32_t layer = 0; layer < BENCH_NUM_LAYERS; ++layer) {
+            auto& layer_storage = storage->layer(layer);
+            auto& k_plane = layer_storage.plane(PlaneKind::K);
+            auto& v_plane = layer_storage.plane(PlaneKind::V);
+            uint32_t newest = k_plane.stats().seq_length - 1;
+
+            auto k_addr = k_plane.locate(LogicalCoord(layer, newest, 0, 0));
+            auto v_addr = v_plane.locate(LogicalCoord(layer, newest, 0, 0));
+            if (k_addr.valid) {
+                auto* k_dst = static_cast<Byte*>(k_plane.data()) + k_addr.byte_offset;
+                std::memcpy(k_dst, token_k.data(), token_k.size());
+            }
+            if (v_addr.valid) {
+                auto* v_dst = static_cast<Byte*>(v_plane.data()) + v_addr.byte_offset;
+                std::memcpy(v_dst, token_v.data(), token_v.size());
+            }
+        }
+
+        // 3) Acquire a window view used by attention.
+        auto& layer0_k = storage->layer(0).plane(PlaneKind::K);
+        uint32_t len = layer0_k.stats().seq_length;
+        uint32_t win = std::min<uint32_t>(len, window_size);
+        AccessView view = layer0_k.acquire_seq_view(len - win, win, AccessMode::ReadOnly);
+        observed_view_bytes += view.bytes;
+        layer0_k.release_seq_view(view);
+    }
+
+    result.time_ms = timer.stop();
+    result.operations = num_steps;  // 1 operation = 1 decode step
+    result.ops_per_sec = result.operations / (result.time_ms / 1000.0);
+    result.ns_per_op = (result.time_ms * 1000000.0) / result.operations;
+
+    (void)observed_view_bytes;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -526,6 +595,13 @@ int main() {
         BenchmarkResult r;
         r.name = "Mixed Precision (Growth)";
         benchmark_mixed_precision_growth(r);
+        print_result(r);
+    }
+
+    {
+        BenchmarkResult r;
+        r.name = "Decode Step (Ring)";
+        benchmark_decode_step_ring(r);
         print_result(r);
     }
 

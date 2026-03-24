@@ -528,6 +528,38 @@ KVCacheStorageBuilder& KVCacheStorageBuilder::config(const KVCacheStorageConfig&
     return *this;
 }
 
+OpaqueScalarId KVCacheStorageBuilder::register_opaque_scalar(const OpaqueScalarDesc& desc) {
+    if (desc.bytes == 0 || desc.alignment == 0) {
+        return 0;
+    }
+    OpaqueScalarId id = next_opaque_scalar_id_++;
+    opaque_scalars_[id] = desc;
+    return id;
+}
+
+const OpaqueScalarDesc* KVCacheStorageBuilder::find_opaque_scalar(OpaqueScalarId id) const {
+    auto it = opaque_scalars_.find(id);
+    if (it == opaque_scalars_.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+std::shared_ptr<KVTemplate> KVCacheStorageBuilder::make_dim_block_template(
+    uint32_t num_heads,
+    uint32_t dim_blocks,
+    OpaqueScalarId scalar_id,
+    TemplateId id,
+    const std::string& name
+) const {
+    const OpaqueScalarDesc* desc = find_opaque_scalar(scalar_id);
+    if (!desc) {
+        return nullptr;
+    }
+    return std::make_shared<DimBlockKVTemplate>(
+        num_heads, dim_blocks, desc->bytes, id, name, desc->alignment);
+}
+
 KVCacheStorageBuilder& KVCacheStorageBuilder::add_template(std::shared_ptr<KVTemplate> templ) {
     templates_.push_back(std::move(templ));
     return *this;
