@@ -524,6 +524,15 @@ bool load_storage_init_config_from_file(
 );
 
 /**
+ * @brief 从文本配置字符串加载StorageInitConfig
+ */
+bool load_storage_init_config_from_string(
+    const std::string& text,
+    StorageInitConfig& out_config,
+    std::string* error_message = nullptr
+);
+
+/**
  * @brief 从配置文件直接创建KV存储
  */
 std::unique_ptr<KVCacheStorage> create_storage_from_config_file(
@@ -536,6 +545,23 @@ std::unique_ptr<KVCacheStorage> create_storage_from_config_file(
  */
 std::unique_ptr<KVCacheStorage> create_storage_from_config_file(
     const std::string& path,
+    const ConfigTypeRegistry* type_registry,
+    std::string* error_message = nullptr
+);
+
+/**
+ * @brief 从配置字符串直接创建KV存储
+ */
+std::unique_ptr<KVCacheStorage> create_storage_from_config_string(
+    const std::string& text,
+    std::string* error_message = nullptr
+);
+
+/**
+ * @brief 从配置字符串直接创建KV存储（支持命名自定义类型）
+ */
+std::unique_ptr<KVCacheStorage> create_storage_from_config_string(
+    const std::string& text,
     const ConfigTypeRegistry* type_registry,
     std::string* error_message = nullptr
 );

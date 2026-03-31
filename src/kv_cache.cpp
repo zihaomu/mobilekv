@@ -392,6 +392,195 @@ bool apply_plane_rules(
 
 }  // namespace
 
+static bool parse_storage_init_config_from_stream(
+    std::istream& in,
+    StorageInitConfig& out_config,
+    std::string* error_message
+) {
+    StorageInitConfig parsed;
+    parsed.num_heads = out_config.num_heads;
+    parsed.head_dim = out_config.head_dim;
+    parsed.storage_config = out_config.storage_config;
+    parsed.layers.clear();
+
+    std::vector<PlaneRule> global_defaults;
+    std::vector<LayerRule> global_groups;
+    std::vector<LayerRule> global_overrides;
+
+    std::string raw_line;
+    size_t line_no = 0;
+
+    while (std::getline(in, raw_line)) {
+        ++line_no;
+
+        const size_t comment_pos = raw_line.find('#');
+        const std::string no_comment =
+            comment_pos == std::string::npos ? raw_line : raw_line.substr(0, comment_pos);
+        const std::string line = trim_copy(no_comment);
+        if (line.empty()) {
+            continue;
+        }
+
+        const std::vector<std::string> tokens = split_whitespace(line);
+        if (tokens.empty()) {
+            continue;
+        }
+
+        const std::string directive = to_lower_copy(tokens[0]);
+        std::unordered_map<std::string, std::string> kv;
+        std::string local_error;
+
+        if (directive == "model") {
+            if (!parse_key_value_tokens(tokens, 1, kv, &local_error)) {
+                set_error(error_message, "line " + std::to_string(line_no) + ": " + local_error);
+                return false;
+            }
+            for (const auto& item : kv) {
+                if (item.first == "num_heads") {
+                    if (!parse_uint32_value(item.second, parsed.num_heads)) {
+                        set_error(error_message, "line " + std::to_string(line_no) +
+                            ": invalid num_heads value '" + item.second + "'");
+                        return false;
+                    }
+                } else if (item.first == "head_dim") {
+                    if (!parse_uint32_value(item.second, parsed.head_dim)) {
+                        set_error(error_message, "line " + std::to_string(line_no) +
+                            ": invalid head_dim value '" + item.second + "'");
+                        return false;
+                    }
+                } else {
+                    set_error(error_message, "line " + std::to_string(line_no) +
+                        ": unknown model key '" + item.first + "'");
+                    return false;
+                }
+            }
+            continue;
+        }
+
+        if (directive == "storage") {
+            if (!parse_key_value_tokens(tokens, 1, kv, &local_error)) {
+                set_error(error_message, "line " + std::to_string(line_no) + ": " + local_error);
+                return false;
+            }
+            for (const auto& item : kv) {
+                if (item.first == "default_alignment") {
+                    if (!parse_size_t_value(item.second, parsed.storage_config.default_alignment)) {
+                        set_error(error_message, "line " + std::to_string(line_no) +
+                            ": invalid default_alignment value '" + item.second + "'");
+                        return false;
+                    }
+                } else if (item.first == "thread_safe") {
+                    if (!parse_bool_value(item.second, parsed.storage_config.thread_safe)) {
+                        set_error(error_message, "line " + std::to_string(line_no) +
+                            ": invalid thread_safe value '" + item.second + "'");
+                        return false;
+                    }
+                } else if (item.first == "default_max_seq_capacity") {
+                    if (!parse_uint32_value(item.second, parsed.storage_config.default_max_seq_capacity)) {
+                        set_error(error_message, "line " + std::to_string(line_no) +
+                            ": invalid default_max_seq_capacity value '" + item.second + "'");
+                        return false;
+                    }
+                } else {
+                    set_error(error_message, "line " + std::to_string(line_no) +
+                        ": unknown storage key '" + item.first + "'");
+                    return false;
+                }
+            }
+            continue;
+        }
+
+        if (directive == "defaults") {
+            if (!parse_key_value_tokens(tokens, 1, kv, &local_error)) {
+                set_error(error_message, "line " + std::to_string(line_no) + ": " + local_error);
+                return false;
+            }
+            PlaneRule rule;
+            rule.kv = std::move(kv);
+            rule.line_no = line_no;
+            global_defaults.push_back(std::move(rule));
+            continue;
+        }
+
+        if (directive == "group") {
+            if (!append_selector_rule(tokens, 1, 2, line_no, global_groups, error_message)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (directive == "override" || directive == "layer") {
+            if (!append_selector_rule(tokens, 1, 2, line_no, global_overrides, error_message)) {
+                return false;
+            }
+            continue;
+        }
+
+        set_error(error_message, "line " + std::to_string(line_no) +
+            ": unknown directive '" + directive + "'");
+        return false;
+    }
+
+    if (parsed.num_heads == 0 || parsed.head_dim == 0) {
+        set_error(error_message, "config missing valid model num_heads/head_dim");
+        return false;
+    }
+
+    std::set<LayerId> layer_ids;
+    collect_layer_ids_from_rules(global_groups, layer_ids);
+    collect_layer_ids_from_rules(global_overrides, layer_ids);
+
+    if (layer_ids.empty()) {
+        set_error(error_message, "config resolved no layers (add group/override/layer rules)");
+        return false;
+    }
+
+    for (LayerId layer_id : layer_ids) {
+        LayerInitConfig layer;
+        layer.layer_id = layer_id;
+        layer.k = PlaneInitConfig();
+        layer.v = PlaneInitConfig();
+
+        if (!apply_plane_rules(global_defaults, layer.k, layer.v, error_message)) {
+            return false;
+        }
+
+        if (!apply_rules_for_layer(layer_id, global_groups, layer.k, layer.v, error_message)) {
+            return false;
+        }
+
+        if (!apply_rules_for_layer(layer_id, global_overrides, layer.k, layer.v, error_message)) {
+            return false;
+        }
+
+        // 如果未显式设置plane max，继承storage默认max
+        if (layer.k.max_seq_capacity == 0 && parsed.storage_config.default_max_seq_capacity > 0) {
+            layer.k.max_seq_capacity = parsed.storage_config.default_max_seq_capacity;
+        }
+        if (layer.v.max_seq_capacity == 0 && parsed.storage_config.default_max_seq_capacity > 0) {
+            layer.v.max_seq_capacity = parsed.storage_config.default_max_seq_capacity;
+        }
+
+        if (layer.k.max_seq_capacity > 0 &&
+            layer.k.initial_seq_capacity > layer.k.max_seq_capacity) {
+            set_error(error_message, "layer " + std::to_string(layer_id) +
+                " has invalid k initial/max capacity");
+            return false;
+        }
+        if (layer.v.max_seq_capacity > 0 &&
+            layer.v.initial_seq_capacity > layer.v.max_seq_capacity) {
+            set_error(error_message, "layer " + std::to_string(layer_id) +
+                " has invalid v initial/max capacity");
+            return false;
+        }
+
+        parsed.layers.push_back(layer);
+    }
+
+    out_config = parsed;
+    return true;
+}
+
 // ============================================================================
 // KVPlane 实现
 // ============================================================================
@@ -1172,189 +1361,16 @@ bool load_storage_init_config_from_file(
         set_error(error_message, "failed to open config file: " + path);
         return false;
     }
+    return parse_storage_init_config_from_stream(in, out_config, error_message);
+}
 
-    StorageInitConfig parsed;
-    parsed.num_heads = out_config.num_heads;
-    parsed.head_dim = out_config.head_dim;
-    parsed.storage_config = out_config.storage_config;
-    parsed.layers.clear();
-
-    std::vector<PlaneRule> global_defaults;
-    std::vector<LayerRule> global_groups;
-    std::vector<LayerRule> global_overrides;
-
-    std::string raw_line;
-    size_t line_no = 0;
-
-    while (std::getline(in, raw_line)) {
-        ++line_no;
-
-        const size_t comment_pos = raw_line.find('#');
-        const std::string no_comment =
-            comment_pos == std::string::npos ? raw_line : raw_line.substr(0, comment_pos);
-        const std::string line = trim_copy(no_comment);
-        if (line.empty()) {
-            continue;
-        }
-
-        const std::vector<std::string> tokens = split_whitespace(line);
-        if (tokens.empty()) {
-            continue;
-        }
-
-        const std::string directive = to_lower_copy(tokens[0]);
-        std::unordered_map<std::string, std::string> kv;
-        std::string local_error;
-
-        if (directive == "model") {
-            if (!parse_key_value_tokens(tokens, 1, kv, &local_error)) {
-                set_error(error_message, "line " + std::to_string(line_no) + ": " + local_error);
-                return false;
-            }
-            for (const auto& item : kv) {
-                if (item.first == "num_heads") {
-                    if (!parse_uint32_value(item.second, parsed.num_heads)) {
-                        set_error(error_message, "line " + std::to_string(line_no) +
-                            ": invalid num_heads value '" + item.second + "'");
-                        return false;
-                    }
-                } else if (item.first == "head_dim") {
-                    if (!parse_uint32_value(item.second, parsed.head_dim)) {
-                        set_error(error_message, "line " + std::to_string(line_no) +
-                            ": invalid head_dim value '" + item.second + "'");
-                        return false;
-                    }
-                } else {
-                    set_error(error_message, "line " + std::to_string(line_no) +
-                        ": unknown model key '" + item.first + "'");
-                    return false;
-                }
-            }
-            continue;
-        }
-
-        if (directive == "storage") {
-            if (!parse_key_value_tokens(tokens, 1, kv, &local_error)) {
-                set_error(error_message, "line " + std::to_string(line_no) + ": " + local_error);
-                return false;
-            }
-            for (const auto& item : kv) {
-                if (item.first == "default_alignment") {
-                    if (!parse_size_t_value(item.second, parsed.storage_config.default_alignment)) {
-                        set_error(error_message, "line " + std::to_string(line_no) +
-                            ": invalid default_alignment value '" + item.second + "'");
-                        return false;
-                    }
-                } else if (item.first == "thread_safe") {
-                    if (!parse_bool_value(item.second, parsed.storage_config.thread_safe)) {
-                        set_error(error_message, "line " + std::to_string(line_no) +
-                            ": invalid thread_safe value '" + item.second + "'");
-                        return false;
-                    }
-                } else if (item.first == "default_max_seq_capacity") {
-                    if (!parse_uint32_value(item.second, parsed.storage_config.default_max_seq_capacity)) {
-                        set_error(error_message, "line " + std::to_string(line_no) +
-                            ": invalid default_max_seq_capacity value '" + item.second + "'");
-                        return false;
-                    }
-                } else {
-                    set_error(error_message, "line " + std::to_string(line_no) +
-                        ": unknown storage key '" + item.first + "'");
-                    return false;
-                }
-            }
-            continue;
-        }
-
-        if (directive == "defaults") {
-            if (!parse_key_value_tokens(tokens, 1, kv, &local_error)) {
-                set_error(error_message, "line " + std::to_string(line_no) + ": " + local_error);
-                return false;
-            }
-            PlaneRule rule;
-            rule.kv = std::move(kv);
-            rule.line_no = line_no;
-            global_defaults.push_back(std::move(rule));
-            continue;
-        }
-
-        if (directive == "group") {
-            if (!append_selector_rule(tokens, 1, 2, line_no, global_groups, error_message)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (directive == "override" || directive == "layer") {
-            if (!append_selector_rule(tokens, 1, 2, line_no, global_overrides, error_message)) {
-                return false;
-            }
-            continue;
-        }
-
-        set_error(error_message, "line " + std::to_string(line_no) +
-            ": unknown directive '" + directive + "'");
-        return false;
-    }
-
-    if (parsed.num_heads == 0 || parsed.head_dim == 0) {
-        set_error(error_message, "config missing valid model num_heads/head_dim");
-        return false;
-    }
-
-    std::set<LayerId> layer_ids;
-    collect_layer_ids_from_rules(global_groups, layer_ids);
-    collect_layer_ids_from_rules(global_overrides, layer_ids);
-
-    if (layer_ids.empty()) {
-        set_error(error_message, "config resolved no layers (add group/override/layer rules)");
-        return false;
-    }
-
-    for (LayerId layer_id : layer_ids) {
-        LayerInitConfig layer;
-        layer.layer_id = layer_id;
-        layer.k = PlaneInitConfig();
-        layer.v = PlaneInitConfig();
-
-        if (!apply_plane_rules(global_defaults, layer.k, layer.v, error_message)) {
-            return false;
-        }
-
-        if (!apply_rules_for_layer(layer_id, global_groups, layer.k, layer.v, error_message)) {
-            return false;
-        }
-
-        if (!apply_rules_for_layer(layer_id, global_overrides, layer.k, layer.v, error_message)) {
-            return false;
-        }
-
-        // 如果未显式设置plane max，继承storage默认max
-        if (layer.k.max_seq_capacity == 0 && parsed.storage_config.default_max_seq_capacity > 0) {
-            layer.k.max_seq_capacity = parsed.storage_config.default_max_seq_capacity;
-        }
-        if (layer.v.max_seq_capacity == 0 && parsed.storage_config.default_max_seq_capacity > 0) {
-            layer.v.max_seq_capacity = parsed.storage_config.default_max_seq_capacity;
-        }
-
-        if (layer.k.max_seq_capacity > 0 &&
-            layer.k.initial_seq_capacity > layer.k.max_seq_capacity) {
-            set_error(error_message, "layer " + std::to_string(layer_id) +
-                " has invalid k initial/max capacity");
-            return false;
-        }
-        if (layer.v.max_seq_capacity > 0 &&
-            layer.v.initial_seq_capacity > layer.v.max_seq_capacity) {
-            set_error(error_message, "layer " + std::to_string(layer_id) +
-                " has invalid v initial/max capacity");
-            return false;
-        }
-
-        parsed.layers.push_back(layer);
-    }
-
-    out_config = parsed;
-    return true;
+bool load_storage_init_config_from_string(
+    const std::string& text,
+    StorageInitConfig& out_config,
+    std::string* error_message
+) {
+    std::istringstream in(text);
+    return parse_storage_init_config_from_stream(in, out_config, error_message);
 }
 
 std::unique_ptr<KVCacheStorage> create_storage_from_config_file(
@@ -1377,6 +1393,31 @@ std::unique_ptr<KVCacheStorage> create_storage_from_config_file(
     if (!storage && error_message) {
         if (error_message->empty()) {
             *error_message = "failed to build storage from parsed config";
+        }
+    }
+    return storage;
+}
+
+std::unique_ptr<KVCacheStorage> create_storage_from_config_string(
+    const std::string& text,
+    std::string* error_message
+) {
+    return create_storage_from_config_string(text, nullptr, error_message);
+}
+
+std::unique_ptr<KVCacheStorage> create_storage_from_config_string(
+    const std::string& text,
+    const ConfigTypeRegistry* type_registry,
+    std::string* error_message
+) {
+    StorageInitConfig config;
+    if (!load_storage_init_config_from_string(text, config, error_message)) {
+        return nullptr;
+    }
+    auto storage = create_storage_from_init_config(config, type_registry, error_message);
+    if (!storage && error_message) {
+        if (error_message->empty()) {
+            *error_message = "failed to build storage from parsed config string";
         }
     }
     return storage;
