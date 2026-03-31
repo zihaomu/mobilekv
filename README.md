@@ -10,6 +10,7 @@ MobileKV currently provides:
 
 - Multi-layer KV storage (`LayerStorage`) with per-layer K/V template binding
 - Mixed precision per plane (`K` and `V` can use different scalar types)
+- Independent sequence capacity control per plane (`K` and `V` can use different initial/max seq)
 - Ring-buffer mode for sliding-window retention
 - Plain and dim-block storage templates
 - Opaque-scalar registry for dim-block template construction
@@ -69,7 +70,32 @@ Behavior:
 
 - 4-arg `add_layer(layer, k_template, v_template, initial)` inherits `config.default_max_seq_capacity`.
 - 5-arg `add_layer(..., initial, max)` explicitly overrides it.
+- 7-arg `add_layer(..., k_initial, v_initial, k_max, v_max)` enables independent K/V capacities.
 - Set `default_max_seq_capacity=0` to keep non-ring growth behavior.
+
+## Independent K/V Capacity
+
+When using 7-arg builder API:
+
+```cpp
+builder.add_layer(
+    0,   // layer_id
+    1,   // k_template
+    2,   // v_template
+    512, // k_initial
+    256, // v_initial
+    2048,// k_max
+    1024 // v_max
+);
+```
+
+K and V ring windows then evolve independently. Check each plane via:
+
+- `layer.plane(PlaneKind::K).stats()`
+- `layer.plane(PlaneKind::V).stats()`
+
+For attention runtime integration, use a consistent effective length policy
+(for example `effective_len = min(k_seq_length, v_seq_length)`) when K/V windows differ.
 
 ## Quick Start
 
@@ -202,7 +228,68 @@ Notes:
 - `create_simple_storage(...)`
 - `create_complex_storage(...)`
 - `create_fp32_storage(...)`, `create_fp16_storage(...)`, `create_int8_storage(...)`
+- `create_storage_from_init_config(...)`
+- `load_storage_init_config_from_file(...)`
+- `create_storage_from_config_file(...)`
 - `KVAccessor<T>` with runtime scalar-type validation
+
+### Declarative Config File Init
+
+`load_storage_init_config_from_file(...)` supports a simple line-based format:
+
+```txt
+model num_heads=32 head_dim=128
+storage default_alignment=64 thread_safe=false default_max_seq_capacity=0
+defaults k_type=fp16 v_type=fp16 initial=512 max=2048
+group 0-31 k_type=int8 max_k=1024
+override 7 v_type=uint8 initial_v=256 max_v=1024
+```
+
+`k_type/v_type/type` currently support:
+
+- Built-in: `fp32`, `fp16`, `bf16`, `int8`, `uint8`, `int16`
+- Registered named custom types (for example `int8_pack4`)
+
+Named custom types in cfg:
+
+- Generic token `custom` is rejected.
+- Register custom type in code first, then reference by name in cfg.
+- Custom types in cfg path are materialized as dim-block templates.
+- `head_dim` must be divisible by registered `dim_pack_factor`.
+
+Register + create example:
+
+```cpp
+ConfigTypeRegistry registry;
+std::string error;
+registry.register_type({"int8_pack4", 4, 4, 4}, &error);
+
+auto storage = create_storage_from_config_file("mobilekv.cfg", &registry, &error);
+if (!storage) {
+    // handle parse/build error
+}
+```
+
+For built-in-only cfg (no named custom types), you can build directly:
+
+```cpp
+std::string error;
+auto storage = create_storage_from_config_file("mobilekv.cfg", &error);
+if (!storage) {
+    // handle parse/build error
+}
+```
+
+Rule precedence (low to high):
+
+- `defaults`
+- `group`
+- `override` (and legacy `layer` alias)
+
+Layer resolution:
+
+- Layers are materialized from `group/override/layer` selectors.
+- If a plane max is still `0`, it inherits `storage.default_max_seq_capacity` when that value is non-zero.
 
 Accessor compatibility:
 
@@ -280,6 +367,9 @@ Run examples:
 ./build_mobilekv/mobilekv_mixed_precision_demo
 ./build_mobilekv/mobilekv_dim_block_demo
 ./build_mobilekv/mobilekv_convenience_demo
+./build_mobilekv/mobilekv_cfg_basic_demo ./example/configs/basic.cfg
+./build_mobilekv/mobilekv_cfg_multi_demo ./example/configs/low.cfg ./example/configs/high.cfg
+./build_mobilekv/mobilekv_cfg_custom_demo ./example/configs/custom_type.cfg
 ```
 
 Run benchmark:
@@ -299,6 +389,13 @@ Benchmark includes both:
 - `example/mixed_precision_example.cpp`
 - `example/dim_block_example.cpp`
 - `example/convenience_api_example.cpp`
+- `example/config_file_basic_example.cpp`
+- `example/config_file_multi_cfg_example.cpp`
+- `example/config_file_custom_type_example.cpp`
+- `example/configs/basic.cfg`
+- `example/configs/low.cfg`
+- `example/configs/high.cfg`
+- `example/configs/custom_type.cfg`
 
 ## Test Coverage (Current Focus)
 

@@ -11,7 +11,6 @@
 #include "mobilekv/kv_cache_convenience.h"
 #include <iostream>
 #include <vector>
-#include <cstring>
 
 using namespace mobilekv;
 
@@ -187,6 +186,49 @@ int main() {
         if (verify_k[0] == 100 && verify_v[0] == 200) {
             std::cout << "Per-head access verification PASSED" << std::endl;
         }
+    }
+
+    // =========================================================================
+    // Example 6: Declarative Init Config
+    // =========================================================================
+    std::cout << "\n--- Example 6: Declarative Init Config ---" << std::endl;
+
+    {
+        StorageInitConfig cfg;
+        cfg.num_heads = 4;
+        cfg.head_dim = 32;
+        cfg.storage_config = {64, false, 0};
+
+        LayerInitConfig l0;
+        l0.layer_id = 0;
+        l0.k.set_builtin_type(ScalarType::INT8);
+        l0.k.initial_seq_capacity = 64;
+        l0.k.max_seq_capacity = 256;
+        l0.v.set_builtin_type(ScalarType::FP16);
+        l0.v.initial_seq_capacity = 64;
+        l0.v.max_seq_capacity = 512;
+
+        LayerInitConfig l1;
+        l1.layer_id = 1;
+        l1.k.set_builtin_type(ScalarType::FP16);
+        l1.k.initial_seq_capacity = 64;
+        l1.k.max_seq_capacity = 512;
+        l1.v.set_builtin_type(ScalarType::FP16);
+        l1.v.initial_seq_capacity = 64;
+        l1.v.max_seq_capacity = 512;
+
+        cfg.layers = {l0, l1};
+
+        auto storage = create_storage_from_init_config(cfg);
+        if (!storage) {
+            std::cerr << "Failed to create storage from init config" << std::endl;
+            return 1;
+        }
+
+        const auto& layer0 = storage->layer(0);
+        std::cout << "Layer0 K max seq: " << layer0.plane(PlaneKind::K).stats().max_seq_capacity
+                  << ", V max seq: " << layer0.plane(PlaneKind::V).stats().max_seq_capacity
+                  << std::endl;
     }
 
     std::cout << "\n=== All Examples Completed ===" << std::endl;

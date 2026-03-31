@@ -286,6 +286,22 @@ struct LayerSpec {
         v_spec.initial_seq_capacity = capacity;
         v_spec.max_seq_capacity = max_capacity;
     }
+
+    // K/V分别配置capacity和max_seq_capacity的构造函数
+    LayerSpec(LayerId id, TemplateId k_templ, TemplateId v_templ,
+              uint32_t k_capacity, uint32_t v_capacity,
+              uint32_t k_max_capacity, uint32_t v_max_capacity)
+        : layer_id(id) {
+        k_spec.kind = PlaneKind::K;
+        k_spec.template_id = k_templ;
+        k_spec.initial_seq_capacity = k_capacity;
+        k_spec.max_seq_capacity = k_max_capacity;
+
+        v_spec.kind = PlaneKind::V;
+        v_spec.template_id = v_templ;
+        v_spec.initial_seq_capacity = v_capacity;
+        v_spec.max_seq_capacity = v_max_capacity;
+    }
 };
 
 // ============================================================================
@@ -605,6 +621,17 @@ public:
         TemplateId v_template,
         uint32_t initial_seq_capacity,
         uint32_t max_seq_capacity  // ring buffer模式下最大序列长度
+    );
+
+    // K/V独立配置版本：支持K/V使用不同initial/max容量
+    KVCacheStorageBuilder& add_layer(
+        LayerId layer,
+        TemplateId k_template,
+        TemplateId v_template,
+        uint32_t k_initial_seq_capacity,
+        uint32_t v_initial_seq_capacity,
+        uint32_t k_max_seq_capacity,
+        uint32_t v_max_seq_capacity
     );
 
     std::unique_ptr<KVCacheStorage> build();

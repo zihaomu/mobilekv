@@ -40,6 +40,21 @@ if(MOBILEKV_BUILD_EXAMPLES)
     example/convenience_api_example.cpp
   )
   target_link_libraries(mobilekv_convenience_demo PRIVATE mobilekv::mobilekv)
+
+  add_executable(mobilekv_cfg_basic_demo
+    example/config_file_basic_example.cpp
+  )
+  target_link_libraries(mobilekv_cfg_basic_demo PRIVATE mobilekv::mobilekv)
+
+  add_executable(mobilekv_cfg_multi_demo
+    example/config_file_multi_cfg_example.cpp
+  )
+  target_link_libraries(mobilekv_cfg_multi_demo PRIVATE mobilekv::mobilekv)
+
+  add_executable(mobilekv_cfg_custom_demo
+    example/config_file_custom_type_example.cpp
+  )
+  target_link_libraries(mobilekv_cfg_custom_demo PRIVATE mobilekv::mobilekv)
 endif()
 
 if(MOBILEKV_BUILD_BENCHMARKS)
